@@ -1,0 +1,32 @@
+[project]
+name = "scrap-downloader"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "cloudscraper>=1.2.71",
+    "gallery-dl>=1.32.3",
+    "httpx>=0.28.1",
+    "nicegui>=3.13.0",
+    "pillow>=12.2.0",
+    "requests>=2.34.2",
+    "sqlalchemy>=2.0.51",
+    "yt-dlp>=2026.6.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.18",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]  # pycodestyle, pyflakes, isort

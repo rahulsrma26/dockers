@@ -1,0 +1,32 @@
+# dev/tooling
+.venv
+.git
+.claude
+.env*
+.python-version
+.ruff_cache
+.pytest_cache
+.nicegui
+
+# macos
+.DS_Store
+
+# python cache
+**/__pycache__
+**/*.pyc
+
+# runtime data (mounted as volumes)
+downloads/
+data/
+tmp/
+*.db
+
+# tests
+tests/
+
+# docs
+README.md
+CLAUDE.md
+
+# misc
+Makefile

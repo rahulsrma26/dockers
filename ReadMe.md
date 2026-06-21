@@ -15,3 +15,7 @@
 - [Key-Value Server](key_value_server/)
 
   A simple in-memory `key-value` server.
+
+- [Scrap Downloader](scrap_downloader/)
+
+  A simple archive server for image and video.

@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    image: welcometors/scrap_downloader:latest
+    container_name: scrap-downloader
+    ports:
+      - "${PORT:-8080}:8080"
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${DOWNLOAD_DIR:-./downloads}:/downloads
+      - ${PLUGINS_DIR:-./plugins}:/plugins
+    environment:
+      - APP_PASSWORD=${APP_PASSWORD:-}
+      - STORAGE_SECRET=${STORAGE_SECRET:-change-me-in-prod}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SESSION_TIMEOUT_MINUTES=${SESSION_TIMEOUT_MINUTES:-60}
+    restart: unless-stopped
