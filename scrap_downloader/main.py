@@ -17,6 +17,47 @@ SESSION_TIMEOUT_MINUTES = int(os.environ.get("SESSION_TIMEOUT_MINUTES", "60"))
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 BUNDLED_PLUGINS_DIR = os.path.join(THIS_DIR, "plugins")
 
+_CELL = "max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
+
+_QUEUE_COLUMNS = [
+    {"name": "id", "label": "ID", "field": "id", "align": "left", "style": "width: 40px"},
+    {"name": "status", "label": "", "field": "status", "align": "left", "style": "width: 36px"},
+    {"name": "tool", "label": "Tool", "field": "tool", "align": "left", "style": "width: 80px"},
+    {
+        "name": "tag",
+        "label": "Tag",
+        "field": "tag",
+        "align": "left",
+        "style": f"width: 160px;{_CELL}",
+    },
+    {
+        "name": "url",
+        "label": "URL",
+        "field": "url",
+        "align": "left",
+        "style": f"width: 40%;{_CELL}",
+    },
+    {
+        "name": "progress",
+        "label": "Progress",
+        "field": "progress",
+        "align": "left",
+        "style": "width: 70px",
+    },
+    {
+        "name": "error",
+        "label": "Error",
+        "field": "error",
+        "align": "left",
+        "style": f"width: 20%;{_CELL}",
+    },
+]
+
+_DETAIL_COLUMNS = [
+    {"name": "field", "label": "Field", "field": "field", "align": "left", "style": "width: 120px"},
+    {"name": "value", "label": "Value", "field": "value", "align": "left"},
+]
+
 
 def seed_plugins():
     plugins_dir = os.environ.get("PLUGINS_DIR", "plugins")
@@ -55,6 +96,67 @@ def logout():
     ui.navigate.to("/login")
 
 
+def _fetch_queue_rows() -> list[dict]:
+    with get_session() as session:
+        tasks = session.query(Task).order_by(Task.created_at.desc()).limit(100).all()
+        session.expunge_all()
+    return [
+        {
+            "id": t.id,
+            "status": {
+                TaskStatus.pending: "⏳",
+                TaskStatus.in_progress: "⬇️",
+                TaskStatus.done: "✅",
+                TaskStatus.failed: "❌",
+            }[t.status],
+            "tool": t.tool,
+            "tag": t.tag,
+            "url": t.url,
+            "progress": f"{t.progress:.0f}%" if t.status == TaskStatus.in_progress else "",
+            "error": t.error or "",
+        }
+        for t in tasks
+    ]
+
+
+def _fetch_task_snapshot(task_id: int) -> dict | None:
+    with get_session() as session:
+        task = session.get(Task, task_id)
+        if task is None:
+            return None
+        return {
+            "id": task.id,
+            "status": task.status,
+            "tool": task.tool,
+            "tag": task.tag,
+            "url": task.url,
+            "extra_args": task.extra_args,
+            "progress": task.progress,
+            "error": task.error,
+            "created_at": task.created_at,
+            "completed_at": task.completed_at,
+        }
+
+
+def _make_detail_rows(snap: dict) -> list[dict]:
+    return [
+        {"field": "ID", "value": str(snap["id"]), "isDate": False},
+        {"field": "Status", "value": snap["status"], "isDate": False},
+        {"field": "Tool", "value": snap["tool"], "isDate": False},
+        {"field": "Tag", "value": snap["tag"], "isDate": False},
+        {"field": "URL", "value": snap["url"], "isDate": False},
+        {"field": "Extra args", "value": snap["extra_args"] or "—", "isDate": False},
+        {"field": "Progress", "value": f"{snap['progress']:.0f}%", "isDate": False},
+        {"field": "Error", "value": snap["error"] or "—", "isDate": False},
+        {"field": "Created at", "value": snap["created_at"].isoformat() + "Z", "isDate": True},
+        {
+            "field": "Completed at",
+            "value": snap["completed_at"].isoformat() + "Z" if snap["completed_at"] else "—",
+            "isDate": bool(snap["completed_at"]),
+        },
+    ]
+
+
 @ui.page("/login")
 def login_page():
     if not PASSWORD:
@@ -75,171 +177,6 @@ def login_page():
         ui.button("Login", on_click=try_login)
 
 
-_detail_open = False
-
-
-def show_task_detail(row: dict):
-    global _detail_open
-    _detail_open = True
-
-    with get_session() as session:
-        task = session.get(Task, row["id"])
-        rows = [
-            {"field": "ID", "value": str(task.id), "isDate": False},
-            {"field": "Status", "value": task.status, "isDate": False},
-            {"field": "Tool", "value": task.tool, "isDate": False},
-            {"field": "Tag", "value": task.tag, "isDate": False},
-            {"field": "URL", "value": task.url, "isDate": False},
-            {"field": "Extra args", "value": task.extra_args or "—", "isDate": False},
-            {"field": "Progress", "value": f"{task.progress:.0f}%", "isDate": False},
-            {"field": "Error", "value": task.error or "—", "isDate": False},
-            {"field": "Created at", "value": task.created_at.isoformat() + "Z", "isDate": True},
-            {
-                "field": "Completed at",
-                "value": task.completed_at.isoformat() + "Z" if task.completed_at else "—",
-                "isDate": bool(task.completed_at),
-            },
-        ]
-        task_id = task.id
-        task_status = task.status
-
-    def cancel():
-        with get_session() as session:
-            t = session.get(Task, task_id)
-            t.status = TaskStatus.failed
-            t.error = "Cancelled by user"
-            t.completed_at = utcnow()
-            session.commit()
-        d.close()
-        queue_table.refresh()
-
-    def retry():
-        with get_session() as session:
-            t = session.get(Task, task_id)
-            t.status = TaskStatus.pending
-            t.progress = 0.0
-            t.error = None
-            t.completed_at = None
-            session.commit()
-        d.close()
-        queue_table.refresh()
-
-    with ui.dialog() as d, ui.card().classes("w-full max-w-2xl"):
-        ui.label(f"Task #{task_id}").classes("text-lg font-semibold mb-2")
-        t = ui.table(
-            columns=[
-                {
-                    "name": "field",
-                    "label": "Field",
-                    "field": "field",
-                    "align": "left",
-                    "style": "width: 120px",
-                },
-                {"name": "value", "label": "Value", "field": "value", "align": "left"},
-            ],
-            rows=rows,
-        ).classes("w-full")
-        t.add_slot(
-            "body-cell-value",
-            """
-            <q-td :props="props">
-                <span v-if="props.row.isDate">
-                    {{ new Date(props.row.value).toLocaleString() }}
-                </span>
-                <span v-else>{{ props.row.value }}</span>
-            </q-td>
-            """,
-        )
-        with ui.row().classes("mt-2 gap-2"):
-            ui.button("Close", on_click=d.close).props("flat")
-            if task_status in (TaskStatus.pending, TaskStatus.in_progress):
-                ui.button("Cancel", icon="cancel", on_click=cancel).props("flat color=negative")
-            if task_status == TaskStatus.failed:
-                ui.button("Retry", icon="replay", on_click=retry).props("flat color=primary")
-    d.on("hide", lambda: globals().update(_detail_open=False))
-    d.open()
-
-
-@ui.refreshable
-def queue_table():
-    with get_session() as session:
-        tasks = session.query(Task).order_by(Task.created_at.desc()).limit(100).all()
-        session.expunge_all()
-
-    if not tasks:
-        ui.label("No tasks yet.").classes("text-gray-400")
-        return
-
-    rows = [
-        {
-            "id": t.id,
-            "status": {
-                TaskStatus.pending: "⏳",
-                TaskStatus.in_progress: "⬇️",
-                TaskStatus.done: "✅",
-                TaskStatus.failed: "❌",
-            }[t.status],
-            "tool": t.tool,
-            "tag": t.tag,
-            "url": t.url,
-            "progress": f"{t.progress:.0f}%" if t.status == TaskStatus.in_progress else "",
-            "error": t.error or "",
-        }
-        for t in tasks
-    ]
-
-    cell = "max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
-    table = ui.table(
-        columns=[
-            {"name": "id", "label": "ID", "field": "id", "align": "left", "style": "width: 40px"},
-            {
-                "name": "status",
-                "label": "",
-                "field": "status",
-                "align": "left",
-                "style": "width: 36px",
-            },
-            {
-                "name": "tool",
-                "label": "Tool",
-                "field": "tool",
-                "align": "left",
-                "style": "width: 80px",
-            },
-            {
-                "name": "tag",
-                "label": "Tag",
-                "field": "tag",
-                "align": "left",
-                "style": "width: 160px;" + cell,
-            },
-            {
-                "name": "url",
-                "label": "URL",
-                "field": "url",
-                "align": "left",
-                "style": "width: 40%;" + cell,
-            },
-            {
-                "name": "progress",
-                "label": "Progress",
-                "field": "progress",
-                "align": "left",
-                "style": "width: 70px",
-            },
-            {
-                "name": "error",
-                "label": "Error",
-                "field": "error",
-                "align": "left",
-                "style": "width: 20%;" + cell,
-            },
-        ],
-        rows=rows,
-    ).classes("w-full table-fixed")
-    table.on("rowClick", lambda e: show_task_detail(e.args[1]))
-
-
 @ui.page("/")
 def main_page():
     if not check_auth():
@@ -248,6 +185,92 @@ def main_page():
 
     ui.page_title("Scrap Downloader")
     ui.add_head_html("<style>.q-table tbody tr { cursor: pointer; }</style>")
+
+    detail_open = {"value": False}
+    queue_tbl: dict = {"ref": None}
+
+    def refresh_queue():
+        if queue_tbl["ref"] is not None:
+            queue_tbl["ref"].rows = _fetch_queue_rows()
+            queue_tbl["ref"].update()
+
+    def show_task_detail(row: dict):
+        detail_open["value"] = True
+        task_id = row["id"]
+
+        snap = _fetch_task_snapshot(task_id)
+        if snap is None:
+            return
+
+        def cancel():
+            with get_session() as session:
+                t = session.get(Task, task_id)
+                t.status = TaskStatus.failed
+                t.error = "Cancelled by user"
+                t.completed_at = utcnow()
+                session.commit()
+            d.close()
+            refresh_queue()
+
+        def retry():
+            with get_session() as session:
+                t = session.get(Task, task_id)
+                t.status = TaskStatus.pending
+                t.progress = 0.0
+                t.error = None
+                t.completed_at = None
+                session.commit()
+            d.close()
+            refresh_queue()
+
+        with ui.dialog() as d, ui.card().classes("w-full max-w-2xl"):
+            ui.label(f"Task #{task_id}").classes("text-lg font-semibold mb-2")
+            detail_tbl = ui.table(columns=_DETAIL_COLUMNS, rows=_make_detail_rows(snap)).classes(
+                "w-full"
+            )
+            detail_tbl.add_slot(
+                "body-cell-value",
+                """
+                <q-td :props="props">
+                    <span v-if="props.row.isDate">
+                        {{ new Date(props.row.value).toLocaleString() }}
+                    </span>
+                    <span v-else>{{ props.row.value }}</span>
+                </q-td>
+                """,
+            )
+            with ui.row().classes("mt-2 gap-2"):
+                ui.button("Close", on_click=d.close).props("flat")
+                cancel_btn = ui.button("Cancel", icon="cancel", on_click=cancel).props(
+                    "flat color=negative"
+                )
+                retry_btn = ui.button("Retry", icon="replay", on_click=retry).props(
+                    "flat color=primary"
+                )
+                cancel_btn.set_visibility(
+                    snap["status"] in (TaskStatus.pending, TaskStatus.in_progress)
+                )
+                retry_btn.set_visibility(snap["status"] == TaskStatus.failed)
+
+        def update_detail():
+            s = _fetch_task_snapshot(task_id)
+            if s is None:
+                return
+            detail_tbl.rows = _make_detail_rows(s)
+            detail_tbl.update()
+            cancel_btn.set_visibility(s["status"] in (TaskStatus.pending, TaskStatus.in_progress))
+            retry_btn.set_visibility(s["status"] == TaskStatus.failed)
+            if s["status"] not in (TaskStatus.pending, TaskStatus.in_progress):
+                detail_timer.cancel()
+
+        detail_timer = ui.timer(2.0, update_detail)
+
+        def on_hide():
+            detail_open["value"] = False
+            detail_timer.cancel()
+
+        d.on("hide", on_hide)
+        d.open()
 
     with ui.column().classes("w-full max-w-4xl mx-auto p-4 gap-4"):
         with ui.row().classes("items-center justify-between w-full"):
@@ -285,7 +308,7 @@ def main_page():
                         url_input.set_value("")
                         tag_input.set_value("")
                         ui.notify(f"Queued: {url}", color="positive")
-                        queue_table.refresh()
+                        refresh_queue()
 
                     ui.button("Add to queue", on_click=submit_auto)
 
@@ -318,7 +341,7 @@ def main_page():
                         gdl_tag_input.set_value("")
                         gdl_args_input.set_value("")
                         ui.notify(f"Queued via gallery-dl: {url}", color="positive")
-                        queue_table.refresh()
+                        refresh_queue()
 
                     ui.button("Add to queue", on_click=submit_gdl)
 
@@ -326,11 +349,17 @@ def main_page():
             with ui.row().classes("items-center justify-between w-full"):
                 ui.label("Queue").classes("text-lg font-semibold")
                 with ui.row().classes("gap-2"):
-                    ui.button(icon="refresh", on_click=queue_table.refresh).props("flat round")
+                    ui.button(icon="refresh", on_click=refresh_queue).props("flat round")
                     ui.button(icon="delete_sweep", on_click=lambda: clear_history()).props(
                         "flat round color=negative"
                     ).tooltip("Clear history")
-            queue_table()
+
+            tbl = ui.table(
+                columns=_QUEUE_COLUMNS,
+                rows=_fetch_queue_rows(),
+            ).classes("w-full table-fixed")
+            tbl.on("rowClick", lambda e: show_task_detail(e.args[1]))
+            queue_tbl["ref"] = tbl
 
     def clear_history():
         with get_session() as session:
@@ -338,16 +367,16 @@ def main_page():
                 Task.status.in_([TaskStatus.done, TaskStatus.failed])
             ).delete()
             session.commit()
-        queue_table.refresh()
+        refresh_queue()
 
     def maybe_refresh():
         if not check_auth():
             ui.navigate.to("/login")
             return
-        if not _detail_open:
-            queue_table.refresh()
+        if not detail_open["value"]:
+            refresh_queue()
 
-    ui.timer(3.0, maybe_refresh)
+    ui.timer(5.0, maybe_refresh)
 
 
 app.on_startup(worker.start)
