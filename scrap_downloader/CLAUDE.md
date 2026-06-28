@@ -6,6 +6,7 @@ See README.md for project docs, stack, and architecture.
 
 - Always use `uv` — never `pip` directly (`uv add`, `uv sync`, `uv run`)
 - Format and lint with `uv run ruff format . && uv run ruff check --fix .` (runs automatically via PostToolUse hook after every `.py` edit)
+- **Bump the patch version in `pyproject.toml` after every edit session** (e.g. `0.1.0` → `0.1.1`). The UI reads the version at startup via `importlib.metadata`.
 
 ## Plugin contract
 

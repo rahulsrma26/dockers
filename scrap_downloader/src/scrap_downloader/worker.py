@@ -7,8 +7,8 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from db import Task, TaskStatus, TaskTool, get_session, utcnow
-from downloader import download_image, download_video, to_download_item
+from .db import Task, TaskStatus, TaskTool, get_session, utcnow
+from .downloader import download_image, download_video, to_download_item
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,12 @@ def _run_gallery_dl(task: Task):
         )
 
     logger.info(result.stdout.strip())
+
+
+def _run_ytdlp(task: Task):
+    save_dir = os.path.join(DOWNLOAD_DIR, task.tag)
+    audio_only = bool(task.extra_args and "--audio-only" in task.extra_args)
+    download_video(task.url, save_dir, audio_only=audio_only)
 
 
 def _run_auto(task: Task):
@@ -95,6 +101,8 @@ def _process(task: Task):
     try:
         if task.tool == TaskTool.gallery_dl:
             _run_gallery_dl(task)
+        elif task.tool == TaskTool.ytdlp:
+            _run_ytdlp(task)
         else:
             _run_auto(task)
     except Exception as e:

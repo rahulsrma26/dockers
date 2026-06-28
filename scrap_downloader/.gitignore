@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+
+# Runtime (created on first run)
+plugins/
+downloads/
+data/
+tmp/
+*.db
+
+# Env
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# NiceGUI
+.nicegui/

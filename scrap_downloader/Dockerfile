@@ -14,6 +14,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
+RUN uv sync --frozen --no-dev
 
 ENV DOWNLOAD_DIR=/downloads \
     PLUGINS_DIR=/plugins \
@@ -23,4 +24,4 @@ ENV DOWNLOAD_DIR=/downloads \
 
 EXPOSE 8080
 
-CMD ["uv", "run", "python", "main.py"]
+CMD ["uv", "run", "scrap-downloader"]

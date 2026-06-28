@@ -58,6 +58,7 @@ def download_video(
     save_dir: str,
     on_progress: Callable[[float], None] | None = None,
     filename: str | None = None,
+    audio_only: bool = False,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
 
@@ -77,6 +78,8 @@ def download_video(
         "quiet": True,
         "no_warnings": True,
     }
+    if audio_only:
+        ydl_opts["format"] = "bestaudio/best"
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)

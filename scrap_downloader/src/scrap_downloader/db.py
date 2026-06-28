@@ -27,6 +27,7 @@ class Base(DeclarativeBase):
 class TaskTool(str, Enum):
     auto = "auto"
     gallery_dl = "gallery-dl"
+    ytdlp = "yt-dlp"
 
 
 class Task(Base):

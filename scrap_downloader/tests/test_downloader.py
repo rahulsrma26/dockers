@@ -1,6 +1,6 @@
 import pytest
 
-from downloader import DownloadItem, to_download_item
+from scrap_downloader.downloader import DownloadItem, to_download_item
 
 
 def test_video_minimal():

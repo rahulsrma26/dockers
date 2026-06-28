@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from db import Base, Task, TaskStatus, TaskTool
+from scrap_downloader.db import Base, Task, TaskStatus, TaskTool, utcnow
 
 
 @pytest.fixture
@@ -70,8 +70,6 @@ def test_gallery_dl_task_with_extra_args(session):
 
 
 def test_completed_at(session):
-    from db import utcnow
-
     task = Task(url="https://example.com", tag="test", tool=TaskTool.auto)
     session.add(task)
     session.commit()
