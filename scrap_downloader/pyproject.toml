@@ -1,6 +1,6 @@
 [project]
 name = "scrap-downloader"
-version = "0.1.3"
+version = "0.1.5"
 description = "Self-hosted archival server for images and videos"
 requires-python = ">=3.13"
 dependencies = [

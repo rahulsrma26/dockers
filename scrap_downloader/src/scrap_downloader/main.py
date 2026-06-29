@@ -2,6 +2,7 @@ import logging
 import os
 import shlex
 import shutil
+import threading
 from datetime import timedelta
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
@@ -10,6 +11,7 @@ from nicegui import app, ui
 
 from . import worker
 from .db import Task, TaskStatus, TaskTool, get_session, init_db, utcnow
+from .tidy import tidy_dir
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -367,6 +369,7 @@ def main_page():
             with ui.tabs().classes("w-full") as tabs:
                 tab_auto = ui.tab("Auto")
                 tab_gdl = ui.tab("gallery-dl")
+                tab_settings = ui.tab("Settings")
 
             with ui.tab_panels(tabs, value=tab_auto).classes("w-full"):
                 with ui.tab_panel(tab_auto):
@@ -524,6 +527,53 @@ def main_page():
                         queue_with_dup_check(url, do_queue)
 
                     ui.button("Add to queue", on_click=submit_gdl)
+
+                with ui.tab_panel(tab_settings):
+                    ui.label("Tidy downloads folder").classes("text-sm font-semibold")
+                    ui.label(
+                        "Groups files ending in a number (e.g. Album 001.jpg, Album 002.jpg) "
+                        "into a sub-folder named after the common prefix. "
+                        "Only moves when 2+ groups are present. Single files are left in place."
+                    ).classes("text-xs text-gray-500 mt-1")
+
+                    tidy_progress = (
+                        ui.linear_progress(0).classes("w-full mt-3").props("instant-feedback")
+                    )
+                    tidy_progress.visible = False
+
+                    def run_tidy():
+                        state = {"done": 0, "total": 0, "finished": False, "count": 0}
+
+                        def on_progress(done, total):
+                            state["done"] = done
+                            state["total"] = total
+
+                        def do_work():
+                            moved = tidy_dir(worker.DOWNLOAD_DIR, on_progress=on_progress)
+                            state["count"] = len(moved)
+                            state["finished"] = True
+
+                        def tick():
+                            if state["total"]:
+                                tidy_progress.value = state["done"] / state["total"]
+                            if state["finished"]:
+                                poll.cancel()
+                                tidy_progress.visible = False
+                                tidy_btn.enable()
+                                if state["count"]:
+                                    ui.notify(f"Tidied {state['count']} file(s)", color="positive")
+                                else:
+                                    ui.notify("Nothing to tidy", color="info")
+
+                        tidy_progress.value = 0
+                        tidy_progress.visible = True
+                        tidy_btn.disable()
+                        poll = ui.timer(0.1, tick)
+                        threading.Thread(target=do_work, daemon=True).start()
+
+                    tidy_btn = ui.button("Tidy", icon="folder_special", on_click=run_tidy).classes(
+                        "mt-3"
+                    )
 
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center justify-between w-full"):
