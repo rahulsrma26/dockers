@@ -7,6 +7,8 @@ import threading
 import time
 from urllib.parse import urlparse
 
+from sqlalchemy import select
+
 from .db import Task, TaskStatus, TaskTool, get_session, utcnow
 from .downloader import download_image, download_video, to_download_item
 
@@ -75,6 +77,8 @@ def _run_auto(task: Task):
             file_pct = (i + pct / 100) / total * 100
             with get_session() as s:
                 t = s.get(Task, task.id)
+                if t is None:
+                    return
                 t.progress = round(file_pct, 1)
                 s.commit()
 
@@ -94,6 +98,8 @@ def _run_auto(task: Task):
 def _process(task: Task):
     with get_session() as session:
         t = session.get(Task, task.id)
+        if t is None:
+            return
         t.status = TaskStatus.in_progress
         t.progress = 0.0
         session.commit()
@@ -111,16 +117,29 @@ def _process(task: Task):
 
     with get_session() as session:
         t = session.get(Task, task.id)
+        if t is None:
+            return
         t.status = TaskStatus.done
         t.progress = 100.0
         t.completed_at = utcnow()
         session.commit()
+
+    # Mini-scan in background — guarded so missing deepface doesn't crash worker
+    try:
+        from . import face as face_mod
+
+        folder = task.tag
+        threading.Thread(target=face_mod.scan_new_download, args=(folder,), daemon=True).start()
+    except Exception as e:
+        logger.debug(f"Mini-scan skipped: {e}")
 
 
 def _fail(task_id: int, error: str):
     logger.error(error)
     with get_session() as session:
         t = session.get(Task, task_id)
+        if t is None:
+            return
         t.status = TaskStatus.failed
         t.error = error
         t.completed_at = utcnow()
@@ -129,12 +148,9 @@ def _fail(task_id: int, error: str):
 
 def _next_pending() -> Task | None:
     with get_session() as session:
-        task = (
-            session.query(Task)
-            .filter(Task.status == TaskStatus.pending)
-            .order_by(Task.created_at)
-            .first()
-        )
+        task = session.execute(
+            select(Task).where(Task.status == TaskStatus.pending).order_by(Task.created_at).limit(1)
+        ).scalar_one_or_none()
         if task:
             session.expunge(task)
         return task

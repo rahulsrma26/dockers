@@ -12,6 +12,7 @@
 .DS_Store
 
 # python cache
+__pycache__
 **/__pycache__
 **/*.pyc
 
@@ -30,3 +31,5 @@ CLAUDE.md
 
 # misc
 Makefile
+docker-compose.yml
+setup_lfw_test.py

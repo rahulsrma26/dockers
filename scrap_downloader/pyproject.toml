@@ -1,17 +1,22 @@
 [project]
 name = "scrap-downloader"
-version = "0.1.5"
+version = "0.3.24"
 description = "Self-hosted archival server for images and videos"
 requires-python = ">=3.13"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "cloudscraper>=1.2.71",
+    "insightface>=0.7.3",
+    "onnxruntime>=1.18.0",
+    "opencv-python-headless>=4.8.0",
     "gallery-dl>=1.32.3",
     "httpx>=0.28.1",
+    "imagehash>=4.3.2",
     "lxml>=6.1.1",
     "nicegui>=3.13.0",
     "pillow>=12.2.0",
     "requests>=2.34.2",
+    "faiss-cpu>=1.8.0",
     "sqlalchemy>=2.0.51",
     "yt-dlp>=2026.6.9",
 ]

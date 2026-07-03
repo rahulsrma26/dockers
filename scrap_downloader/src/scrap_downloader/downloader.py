@@ -39,10 +39,14 @@ def to_download_item(item) -> DownloadItem:
 def download_image(
     url: str,
     save_dir: str,
-    filename: str,
+    filename: str | None = None,
     headers: dict | None = None,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
+    if not filename:
+        from urllib.parse import urlparse
+
+        filename = os.path.basename(urlparse(url).path) or "image"
     save_path = os.path.join(save_dir, filename)
     with httpx.stream("GET", url, headers=headers or {}, follow_redirects=True, timeout=60) as r:
         r.raise_for_status()

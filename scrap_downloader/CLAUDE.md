@@ -6,7 +6,8 @@ See README.md for project docs, stack, and architecture.
 
 - Always use `uv` — never `pip` directly (`uv add`, `uv sync`, `uv run`)
 - Format and lint with `uv run ruff format . && uv run ruff check --fix .` (runs automatically via PostToolUse hook after every `.py` edit)
-- **Bump the patch version in `pyproject.toml` after every edit session** (e.g. `0.1.0` → `0.1.1`). The UI reads the version at startup via `importlib.metadata`.
+- **Never drop imports when editing a file.** Before every Edit that touches the top of a file or replaces a large block, read the current imports first. After the edit, verify the import list is intact. If ruff removes an import as "unused", it means the usage site was also dropped — restore both.
+- **Before bumping the version, run `uv run pytest -q` and confirm all tests pass.** Only then bump the patch version in `pyproject.toml` (e.g. `0.1.0` → `0.1.1`). The UI reads the version at startup via `importlib.metadata`.
 
 ## Plugin contract
 

@@ -2,16 +2,24 @@ import logging
 import os
 import shlex
 import shutil
-import threading
 from datetime import timedelta
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 
 from nicegui import app, ui
+from sqlalchemy import delete, select
 
 from . import worker
-from .db import Task, TaskStatus, TaskTool, get_session, init_db, utcnow
-from .tidy import tidy_dir
+from .db import (
+    Task,
+    TaskStatus,
+    TaskTool,
+    get_scan_meta,
+    get_session,
+    init_db,
+    set_scan_meta,
+    utcnow,
+)
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -126,7 +134,10 @@ def seed_plugins():
 
 
 def touch_activity():
-    app.storage.user["last_activity"] = utcnow().isoformat()
+    try:
+        app.storage.user["last_activity"] = utcnow().isoformat()
+    except RuntimeError:
+        pass
 
 
 def check_auth() -> bool:
@@ -139,7 +150,10 @@ def check_auth() -> bool:
         return False
     from datetime import datetime
 
-    elapsed = utcnow() - datetime.fromisoformat(last)
+    try:
+        elapsed = utcnow() - datetime.fromisoformat(last)
+    except (ValueError, TypeError):
+        return False
     return elapsed < timedelta(minutes=SESSION_TIMEOUT_MINUTES)
 
 
@@ -158,7 +172,9 @@ _STATUS_EMOJI = {
 
 def _find_duplicate(url: str) -> dict | None:
     with get_session() as session:
-        task = session.query(Task).filter(Task.url == url).order_by(Task.created_at.desc()).first()
+        task = session.execute(
+            select(Task).where(Task.url == url).order_by(Task.created_at.desc()).limit(1)
+        ).scalar_one_or_none()
         if task is None:
             return None
         return {"tag": task.tag, "status": task.status}
@@ -166,7 +182,11 @@ def _find_duplicate(url: str) -> dict | None:
 
 def _fetch_queue_rows() -> list[dict]:
     with get_session() as session:
-        tasks = session.query(Task).order_by(Task.created_at.desc()).limit(100).all()
+        tasks = (
+            session.execute(select(Task).order_by(Task.created_at.desc()).limit(100))
+            .scalars()
+            .all()
+        )
         session.expunge_all()
     return [
         {
@@ -290,6 +310,9 @@ def main_page():
         def cancel():
             with get_session() as session:
                 t = session.get(Task, task_id)
+                if t is None:
+                    d.close()
+                    return
                 t.status = TaskStatus.failed
                 t.error = "Cancelled by user"
                 t.completed_at = utcnow()
@@ -300,6 +323,9 @@ def main_page():
         def retry():
             with get_session() as session:
                 t = session.get(Task, task_id)
+                if t is None:
+                    d.close()
+                    return
                 t.status = TaskStatus.pending
                 t.progress = 0.0
                 t.error = None
@@ -362,6 +388,8 @@ def main_page():
             with ui.row().classes("items-baseline gap-2"):
                 ui.label("Scrap Downloader").classes("text-2xl font-bold")
                 ui.label(f"v{APP_VERSION}").classes("text-sm text-gray-400")
+                ui.link("Downloads", "/").classes("text-sm text-blue-500 ml-4")
+                ui.link("Organize", "/organize").classes("text-sm text-blue-500")
             if PASSWORD:
                 ui.button("Logout", icon="logout", on_click=logout).props("flat")
 
@@ -369,7 +397,6 @@ def main_page():
             with ui.tabs().classes("w-full") as tabs:
                 tab_auto = ui.tab("Auto")
                 tab_gdl = ui.tab("gallery-dl")
-                tab_settings = ui.tab("Settings")
 
             with ui.tab_panels(tabs, value=tab_auto).classes("w-full"):
                 with ui.tab_panel(tab_auto):
@@ -528,53 +555,6 @@ def main_page():
 
                     ui.button("Add to queue", on_click=submit_gdl)
 
-                with ui.tab_panel(tab_settings):
-                    ui.label("Tidy downloads folder").classes("text-sm font-semibold")
-                    ui.label(
-                        "Groups files ending in a number (e.g. Album 001.jpg, Album 002.jpg) "
-                        "into a sub-folder named after the common prefix. "
-                        "Only moves when 2+ groups are present. Single files are left in place."
-                    ).classes("text-xs text-gray-500 mt-1")
-
-                    tidy_progress = (
-                        ui.linear_progress(0).classes("w-full mt-3").props("instant-feedback")
-                    )
-                    tidy_progress.visible = False
-
-                    def run_tidy():
-                        state = {"done": 0, "total": 0, "finished": False, "count": 0}
-
-                        def on_progress(done, total):
-                            state["done"] = done
-                            state["total"] = total
-
-                        def do_work():
-                            moved = tidy_dir(worker.DOWNLOAD_DIR, on_progress=on_progress)
-                            state["count"] = len(moved)
-                            state["finished"] = True
-
-                        def tick():
-                            if state["total"]:
-                                tidy_progress.value = state["done"] / state["total"]
-                            if state["finished"]:
-                                poll.cancel()
-                                tidy_progress.visible = False
-                                tidy_btn.enable()
-                                if state["count"]:
-                                    ui.notify(f"Tidied {state['count']} file(s)", color="positive")
-                                else:
-                                    ui.notify("Nothing to tidy", color="info")
-
-                        tidy_progress.value = 0
-                        tidy_progress.visible = True
-                        tidy_btn.disable()
-                        poll = ui.timer(0.1, tick)
-                        threading.Thread(target=do_work, daemon=True).start()
-
-                    tidy_btn = ui.button("Tidy", icon="folder_special", on_click=run_tidy).classes(
-                        "mt-3"
-                    )
-
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center justify-between w-full"):
                 ui.label("Queue").classes("text-lg font-semibold")
@@ -593,9 +573,9 @@ def main_page():
 
     def clear_history():
         with get_session() as session:
-            session.query(Task).filter(
-                Task.status.in_([TaskStatus.done, TaskStatus.failed])
-            ).delete()
+            session.execute(
+                delete(Task).where(Task.status.in_([TaskStatus.done, TaskStatus.failed]))
+            )
             session.commit()
         refresh_queue()
 
@@ -609,11 +589,36 @@ def main_page():
     ui.timer(5.0, maybe_refresh)
 
 
+def _startup():
+    worker.start()
+    # Reset stale scan status from a previous crash
+    status = get_scan_meta("status", "idle")
+    if status in ("running", "cancelling"):
+        set_scan_meta("status", "idle")
+    # Resume any incomplete merges
+    try:
+        from . import face as face_mod
+
+        face_mod.resume_incomplete_merges()
+    except Exception as e:
+        logger.warning(f"resume_incomplete_merges failed: {e}")
+
+
 def main():
-    app.on_startup(worker.start)
-    app.on_shutdown(worker.stop)
     init_db()
     seed_plugins()
+
+    DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
+    thumbs_dir = os.path.join(DOWNLOAD_DIR, ".thumbs")
+    os.makedirs(thumbs_dir, exist_ok=True)
+    app.add_static_files("/thumbs", thumbs_dir)
+    app.add_static_files("/files", DOWNLOAD_DIR)
+
+    # Register organize page
+    from . import organize as _organize_mod  # noqa: F401
+
+    app.on_startup(_startup)
+    app.on_shutdown(worker.stop)
     ui.run(
         host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", 8080)),
