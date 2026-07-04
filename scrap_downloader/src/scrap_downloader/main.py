@@ -16,6 +16,7 @@ from .db import (
     TaskTool,
     get_scan_meta,
     get_session,
+    get_setting,
     init_db,
     set_scan_meta,
     utcnow,
@@ -30,7 +31,7 @@ except PackageNotFoundError:
     APP_VERSION = "dev"
 
 PASSWORD = os.environ.get("APP_PASSWORD", "")
-SESSION_TIMEOUT_MINUTES = int(os.environ.get("SESSION_TIMEOUT_MINUTES", "60"))
+SESSION_TIMEOUT_MINUTES = int(os.environ.get("SESSION_TIMEOUT_MINUTES", "15"))
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 BUNDLED_PLUGINS_DIR = os.path.join(THIS_DIR, "plugins")
@@ -154,10 +155,18 @@ def check_auth() -> bool:
         elapsed = utcnow() - datetime.fromisoformat(last)
     except (ValueError, TypeError):
         return False
-    return elapsed < timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    db_timeout = int(get_setting("auto_logout_minutes") or "0")
+    timeout = db_timeout if db_timeout > 0 else SESSION_TIMEOUT_MINUTES
+    return elapsed < timedelta(minutes=timeout)
 
 
 def logout():
+    app.storage.user.clear()
+    ui.navigate.to("/login")
+
+
+@ui.page("/logout")
+def logout_page():
     app.storage.user.clear()
     ui.navigate.to("/login")
 

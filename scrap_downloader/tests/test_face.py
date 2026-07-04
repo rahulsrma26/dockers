@@ -1382,3 +1382,118 @@ def test_score_against_people_returns_sorted_scores():
     items = list(scores.items())
     assert items[0][0] == "person_a"
     assert items[1][0] == "person_b"
+
+
+# ── file_map population ───────────────────────────────────────────────────────
+
+
+def test_merge_into_populates_file_map():
+    """merge_into saves file_map JSON in MergeLog with old→new mapping."""
+    import json
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    _make_file("album/photo.jpg", b"data")
+    _insert_image_meta("album/photo.jpg", sha256="aaa")
+
+    face_mod.merge_into(["album"], "alice")
+
+    with Session(db_mod.engine) as s:
+        log = s.execute(select(MergeLog)).scalars().first()
+
+    assert log.file_map is not None
+    fm = json.loads(log.file_map)
+    assert isinstance(fm, dict)
+    assert len(fm) == 1
+    key = list(fm.keys())[0]
+    assert key == "album/photo.jpg"
+    assert fm[key] == "categorized/alice/photo.jpg"
+
+
+def test_merge_into_file_map_duplicate_is_null():
+    """Exact duplicate deleted during merge is stored as null in file_map."""
+    import json
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    _make_file("album/photo.jpg", b"same")
+    _make_file("categorized/alice/photo.jpg", b"same")
+    _insert_image_meta("album/photo.jpg", sha256="same_hash")
+    _insert_image_meta("categorized/alice/photo.jpg", sha256="same_hash")
+
+    face_mod.merge_into(["album"], "alice")
+
+    with Session(db_mod.engine) as s:
+        log = s.execute(select(MergeLog)).scalars().first()
+
+    assert log.file_map is not None
+    fm = json.loads(log.file_map)
+    assert "album/photo.jpg" in fm
+    assert fm["album/photo.jpg"] is None
+
+
+# ── undo_merge ────────────────────────────────────────────────────────────────
+
+
+def test_undo_merge_not_found():
+    """undo_merge returns error when log_id doesn't exist."""
+    result = face_mod.undo_merge(9999)
+    assert result is not None
+    assert "not found" in result.lower() or "9999" in result
+
+
+def test_undo_merge_scan_running(monkeypatch):
+    """undo_merge refuses when a scan is in progress."""
+    from scrap_downloader.db import set_scan_meta
+
+    set_scan_meta("status", "running")
+    result = face_mod.undo_merge(1)
+    assert result is not None
+    assert "scan" in result.lower() or "running" in result.lower()
+
+
+def test_undo_merge_preflight_new_file_missing():
+    """undo_merge fails pre-flight if file was moved/deleted after merge."""
+    from sqlalchemy.orm import Session
+
+    _make_file("album/photo.jpg", b"data")
+    _insert_image_meta("album/photo.jpg", sha256="abc")
+    face_mod.merge_into(["album"], "alice")
+
+    # Remove the newly merged file to simulate missing file
+    merged_path = os.path.join(_dl(), "categorized/alice/photo.jpg")
+    os.remove(merged_path)
+
+    with Session(db_mod.engine) as s:
+        log = (
+            s.execute(__import__("sqlalchemy", fromlist=["select"]).select(MergeLog))
+            .scalars()
+            .first()
+        )
+
+    result = face_mod.undo_merge(log.id)
+    assert result is not None
+
+
+def test_undo_merge_preflight_old_path_occupied():
+    """undo_merge fails pre-flight if new file already at old_rel path."""
+    from sqlalchemy.orm import Session
+
+    _make_file("album/photo.jpg", b"data")
+    _insert_image_meta("album/photo.jpg", sha256="abc")
+    face_mod.merge_into(["album"], "alice")
+
+    # Recreate a file at the original path (simulating a new download there)
+    _make_file("album/photo.jpg", b"new_data")
+
+    with Session(db_mod.engine) as s:
+        log = (
+            s.execute(__import__("sqlalchemy", fromlist=["select"]).select(MergeLog))
+            .scalars()
+            .first()
+        )
+
+    result = face_mod.undo_merge(log.id)
+    assert result is not None

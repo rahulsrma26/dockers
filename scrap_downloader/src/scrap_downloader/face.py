@@ -263,6 +263,18 @@ def _scan_file(file_path: str, face_model: str) -> int:
             select(ImageMeta).where(ImageMeta.file_path == rel)
         ).scalar_one_or_none()
         if existing and existing.file_mtime == mtime:
+            # Backfill file_size for files scanned before this column was added.
+            if existing.file_size is None:
+                try:
+                    with get_session() as s2:
+                        row = s2.execute(
+                            select(ImageMeta).where(ImageMeta.file_path == rel)
+                        ).scalar_one_or_none()
+                        if row:
+                            row.file_size = os.path.getsize(file_path)
+                            s2.commit()
+                except Exception:
+                    pass
             # Backfill: if this is a video with no thumbnail yet, generate it now.
             # Handles collections scanned before video thumb support was added.
             ext = os.path.splitext(file_path)[1].lower()
@@ -286,6 +298,7 @@ def _scan_image_file(file_path: str, rel: str, mtime: float, face_model: str) ->
     import imagehash
     from PIL import Image
 
+    file_size = os.path.getsize(file_path)
     phash_val = None
     sha256_val = _sha256_file(file_path)
     face_count = 0
@@ -337,6 +350,7 @@ def _scan_image_file(file_path: str, rel: str, mtime: float, face_model: str) ->
             existing.sha256 = sha256_val
             existing.face_count = face_count
             existing.max_face_ratio = max_face_ratio
+            existing.file_size = file_size
             existing.file_mtime = mtime
             existing.scanned_at = utcnow()
         else:
@@ -347,6 +361,7 @@ def _scan_image_file(file_path: str, rel: str, mtime: float, face_model: str) ->
                     sha256=sha256_val,
                     face_count=face_count,
                     max_face_ratio=max_face_ratio,
+                    file_size=file_size,
                     file_mtime=mtime,
                 )
             )
@@ -392,6 +407,7 @@ def _generate_video_thumb(file_path: str, rel_path: str) -> None:
 
 
 def _scan_video_file(file_path: str, rel: str, mtime: float) -> None:
+    file_size = os.path.getsize(file_path)
     sha256_val = _sha256_file(file_path, limit_bytes=10 * 1024 * 1024)
 
     with get_session() as s:
@@ -400,6 +416,7 @@ def _scan_video_file(file_path: str, rel: str, mtime: float) -> None:
         ).scalar_one_or_none()
         if existing:
             existing.sha256 = sha256_val
+            existing.file_size = file_size
             existing.file_mtime = mtime
             existing.scanned_at = utcnow()
         else:
@@ -407,6 +424,7 @@ def _scan_video_file(file_path: str, rel: str, mtime: float) -> None:
                 ImageMeta(
                     file_path=rel,
                     sha256=sha256_val,
+                    file_size=file_size,
                     file_mtime=mtime,
                 )
             )
@@ -1063,6 +1081,7 @@ def merge_into(
 
     total = len(all_files)
     moved = 0
+    file_map: dict[str, str | None] = {}
 
     for src_file in all_files:
         rel = _rel(src_file)
@@ -1074,6 +1093,7 @@ def merge_into(
 
         # Exact duplicate → delete source (dest already has identical copy)
         if src_sha256 and src_sha256 in dest_files_map:
+            file_map[rel] = None
             _purge_src_file(rel, src_file)
             moved += 1
             if on_progress:
@@ -1089,6 +1109,7 @@ def merge_into(
             dest_size = os.path.getsize(phash_match)
             if src_size <= dest_size:
                 # Dest already has an equal-or-better copy — delete inferior source
+                file_map[rel] = None
                 _purge_src_file(rel, src_file)
                 moved += 1
                 if on_progress:
@@ -1126,6 +1147,7 @@ def merge_into(
 
         shutil.move(src_file, dest_file)
         new_rel = _rel(dest_file)
+        file_map[rel] = new_rel
 
         # Update DB paths
         with get_session() as s:
@@ -1206,12 +1228,13 @@ def merge_into(
     # Clear last_scan
     set_scan_meta("last_scan", None)
 
-    # Mark merge log done
+    # Mark merge log done; save file_map in same commit (atomic)
     with get_session() as s:
         log = s.get(MergeLog, log_id)
         if log:
             log.status = "done"
             log.completed_at = utcnow()
+            log.file_map = json.dumps(file_map)
         s.commit()
 
 
@@ -1227,6 +1250,86 @@ def _remove_empty_dirs(path: str) -> None:
                 os.rmdir(root)
         except OSError:
             pass
+
+
+# ── undo_merge ────────────────────────────────────────────────────────────────
+
+
+def undo_merge(log_id: int) -> str | None:
+    """Reverse a completed merge. Returns error string or None on success."""
+    import shutil
+
+    if get_scan_meta("status") in ("running", "cancelling"):
+        return "Cannot undo while a scan is in progress"
+
+    with get_session() as s:
+        log = s.get(MergeLog, log_id)
+        if log is None or log.status != "done":
+            return "Merge not found or already undone"
+        if not log.file_map:
+            return "This merge was recorded before undo support was added"
+        dest = log.dest
+        file_map = json.loads(log.file_map)
+
+    # Pre-flight: check BOTH directions before moving anything
+    missing, occupied = [], []
+    for old_rel, new_rel in file_map.items():
+        if new_rel is None:
+            continue
+        if not os.path.exists(os.path.abspath(os.path.join(DOWNLOAD_DIR, new_rel))):
+            missing.append(new_rel)
+        if os.path.exists(os.path.abspath(os.path.join(DOWNLOAD_DIR, old_rel))):
+            occupied.append(old_rel)
+    if missing:
+        return f"Cannot undo: {len(missing)} file(s) no longer at destination"
+    if occupied:
+        return f"Cannot undo: {len(occupied)} original path(s) are occupied by newer files"
+
+    # Move files back
+    for old_rel, new_rel in file_map.items():
+        if new_rel is None:
+            continue
+        new_abs = os.path.abspath(os.path.join(DOWNLOAD_DIR, new_rel))
+        old_abs = os.path.abspath(os.path.join(DOWNLOAD_DIR, old_rel))
+        os.makedirs(os.path.dirname(old_abs), exist_ok=True)
+        shutil.move(new_abs, old_abs)
+
+        with get_session() as s:
+            meta = s.execute(
+                select(ImageMeta).where(ImageMeta.file_path == new_rel)
+            ).scalar_one_or_none()
+            if meta:
+                meta.file_path = old_rel
+            for fe in (
+                s.execute(select(FaceEmbedding).where(FaceEmbedding.file_path == new_rel))
+                .scalars()
+                .all()
+            ):
+                fe.file_path = old_rel
+            s.commit()
+
+        old_thumb = _thumb_path(new_rel)
+        if os.path.exists(old_thumb):
+            os.rename(old_thumb, _thumb_path(old_rel))
+
+    # Clean up dest folder if now empty
+    dest_abs = os.path.abspath(os.path.join(_categorized_dir(), dest))
+    _remove_empty_dirs(dest_abs)
+
+    # Recompute centroids — covers both dest and restored source folders
+    _recompute_centroids(get_setting("face_model", "buffalo_s"))
+
+    # Mark undone + clear stale suggestion cache
+    with get_session() as s:
+        log = s.get(MergeLog, log_id)
+        if log:
+            log.status = "undone"
+            s.commit()
+    set_scan_meta("last_scan", None)
+    set_scan_meta("last_suggestions", None)
+    set_scan_meta("last_ambiguous", None)
+
+    return None
 
 
 # ── rename_person ─────────────────────────────────────────────────────────────

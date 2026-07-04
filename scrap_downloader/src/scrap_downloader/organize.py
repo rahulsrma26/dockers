@@ -8,24 +8,102 @@ import os
 from typing import Any
 from urllib.parse import quote
 
-from nicegui import ui
-from sqlalchemy import select
+from nicegui import app, ui
+from sqlalchemy import delete, select
 
 from .db import (
+    DismissedMatch,
+    FaceEmbedding,
     ImageMeta,
+    MergeLog,
     Notification,
     get_scan_meta,
     get_session,
     get_setting,
     set_scan_meta,
     set_setting,
+    utcnow,
 )
-from .face import _like_prefix
-from .main import APP_VERSION, PASSWORD, check_auth, logout, touch_activity
+from .face import _like_prefix, _thumb_path
+from .main import APP_VERSION, PASSWORD, SESSION_TIMEOUT_MINUTES, check_auth, logout, touch_activity
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 
 _ILLEGAL_CHARS = set('/\\:*?"<>|')
+
+_LG_INIT_JS = (
+    "(function tryInit() {"
+    "  var el = document.getElementById('lg-gallery');"
+    "  if (!el || !window.lightGallery) { setTimeout(tryInit, 100); return; }"
+    "  window.lgInstance = lightGallery(el, {"
+    "    plugins: [lgZoom, lgThumbnail, lgVideo],"
+    "    speed: 300, download: true, selector: '.lg-item',"
+    "  });"
+    "})();"
+)
+
+
+def _auto_logout_js() -> str:
+    """Return a <script> tag that redirects to /logout after inactivity. Empty if disabled."""
+    if not PASSWORD:
+        return ""
+    minutes = int(get_setting("auto_logout_minutes") or SESSION_TIMEOUT_MINUTES)
+    if minutes == 0:
+        return ""
+    ms = minutes * 60 * 1000
+    return (
+        "<script>(function(){"
+        f"var t,ms={ms};"
+        "function r(){clearTimeout(t);"
+        "t=setTimeout(function(){window.location.href='/logout';},ms);}"
+        "['mousemove','mousedown','keydown','touchstart','click','scroll','wheel']"
+        ".forEach(function(e){document.addEventListener(e,r,true);});"
+        "r();"
+        "})()</script>"
+    )
+
+
+def _human_size(n: int | None) -> str:
+    if n is None:
+        return "—"
+    if n == 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _get_stats_data() -> dict:
+    with get_session() as s:
+        rows = s.execute(select(ImageMeta.file_path, ImageMeta.file_size)).all()
+
+    total_files = len(rows)
+    total_size = sum(r.file_size or 0 for r in rows)
+    has_size = any(r.file_size is not None for r in rows)
+
+    cat_files = [r for r in rows if r.file_path.startswith("categorized/")]
+    uncat_files = [r for r in rows if not r.file_path.startswith("categorized/")]
+
+    tag_counts: dict[str, tuple[int, int]] = {}
+    for r in uncat_files:
+        tag = r.file_path.split("/")[0] or "(root)"
+        c, sz = tag_counts.get(tag, (0, 0))
+        tag_counts[tag] = (c + 1, sz + (r.file_size or 0))
+
+    by_tag = sorted(tag_counts.items(), key=lambda kv: kv[1][0], reverse=True)
+
+    return {
+        "total_files": total_files,
+        "total_size": total_size if has_size else None,
+        "cat_count": len(cat_files),
+        "cat_size": sum(r.file_size or 0 for r in cat_files) if has_size else None,
+        "uncat_count": len(uncat_files),
+        "uncat_size": sum(r.file_size or 0 for r in uncat_files) if has_size else None,
+        "has_size": has_size,
+        "by_tag": by_tag,
+    }
 
 
 def _categorized_dir() -> str:
@@ -109,7 +187,7 @@ def _person_images(person_name: str) -> list[dict]:
         ext = os.path.splitext(rel)[1].lower()
         thumb = f"/thumbs/{hashlib.sha256(r.file_path.encode()).hexdigest()}.jpg"
         src = f"/files/{rel}"
-        item: dict = {"src": src, "thumb": thumb, "filename": os.path.basename(rel)}
+        item: dict = {"rel": rel, "src": src, "thumb": thumb, "filename": os.path.basename(rel)}
         if ext in _VIDEO_EXTS:
             item["is_video"] = True
             item["video_type"] = _VIDEO_MIME.get(ext, "video/mp4")
@@ -132,7 +210,12 @@ def _list_people() -> list[str]:
     if not os.path.isdir(cat):
         return []
     return sorted(
-        p for p in os.listdir(cat) if os.path.isdir(os.path.join(cat, p)) and not p.startswith(".")
+        (
+            p
+            for p in os.listdir(cat)
+            if os.path.isdir(os.path.join(cat, p)) and not p.startswith(".")
+        ),
+        key=str.casefold,
     )
 
 
@@ -171,6 +254,10 @@ def organize_page(tab: str = "scan"):
         return
 
     ui.page_title("Organize — Scrap Downloader")
+    ui.add_body_html(_auto_logout_js())
+
+    dark = ui.dark_mode()
+    dark.set_value(app.storage.user.get("dark_mode", False))
 
     # State shared across tabs
     _saved_sugg = get_scan_meta("last_suggestions")
@@ -186,6 +273,11 @@ def organize_page(tab: str = "scan"):
         "active_tab": tab,
     }
 
+    def _toggle_dark(dark=dark):
+        new_val = not dark.value
+        dark.set_value(new_val)
+        app.storage.user["dark_mode"] = new_val
+
     # ── Header ──
     with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-4"):
         with ui.row().classes("items-center justify-between w-full"):
@@ -194,8 +286,12 @@ def organize_page(tab: str = "scan"):
                 ui.label(f"v{APP_VERSION}").classes("text-sm text-gray-400")
                 ui.link("Downloads", "/").classes("text-sm text-blue-500 ml-4")
                 ui.link("Organize", "/organize").classes("text-sm text-blue-500 font-semibold")
-            if PASSWORD:
-                ui.button("Logout", icon="logout", on_click=logout).props("flat")
+            with ui.row().classes("gap-1"):
+                ui.button(icon="dark_mode", on_click=_toggle_dark).props("flat round").tooltip(
+                    "Toggle dark mode"
+                )
+                if PASSWORD:
+                    ui.button("Logout", icon="logout", on_click=logout).props("flat")
 
         # Notification banner
         notifs = _poll_notifications()
@@ -235,9 +331,7 @@ def organize_page(tab: str = "scan"):
 
         def _sync_tab_url(e):
             slug = _label_to_slug.get(e.args, "scan")
-            ui.run_javascript(
-                f"history.replaceState(null, '', '/organize?tab={slug}')", respond=False
-            )
+            ui.run_javascript(f"history.replaceState(null, '', '/organize?tab={slug}')")
 
         tabs.on("update:model-value", _sync_tab_url)
 
@@ -319,6 +413,46 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
     progress_bar = ui.linear_progress(value=0).classes("w-full").props("instant-feedback")
     counter_label = ui.label("").classes("text-xs text-gray-400")
 
+    # ── Storage stats card ───────────────────────────────────────────────────────
+    with ui.card().classes("w-full mt-2"):
+        ui.label("Media storage").classes("text-sm font-semibold mb-1")
+        stats_placeholder = ui.label("Scan in progress — stats will update when complete.").classes(
+            "text-xs text-gray-400"
+        )
+        stats_body = ui.column().classes("w-full gap-1")
+
+    def _refresh_stats():
+        scan_st = get_scan_meta("status", "idle")
+        if scan_st in ("running", "cancelling"):
+            stats_placeholder.set_visibility(True)
+            stats_body.set_visibility(False)
+            return
+        stats_placeholder.set_visibility(False)
+        stats_body.set_visibility(True)
+        stats_body.clear()
+        d = _get_stats_data()
+        with stats_body:
+            with ui.row().classes("gap-4 text-sm"):
+                ui.label(f"Total: {d['total_files']} files")
+                ui.label(f"Size: {_human_size(d['total_size'])}")
+            with ui.row().classes("gap-4 text-xs text-gray-500"):
+                ui.label(f"Categorized: {d['cat_count']} ({_human_size(d['cat_size'])})")
+                ui.label(f"Uncategorized: {d['uncat_count']} ({_human_size(d['uncat_size'])})")
+            if not d["has_size"]:
+                ui.label("File sizes will appear after the next scan.").classes(
+                    "text-xs text-gray-400 italic"
+                )
+            if d["by_tag"]:
+                ui.separator().classes("my-1")
+                for tag, (count, size) in d["by_tag"][:10]:
+                    with ui.row().classes("justify-between text-xs"):
+                        ui.label(tag).classes("text-gray-600")
+                        ui.label(f"{count} files · {_human_size(size) if d['has_size'] else '—'}")
+            elif d["uncat_count"] == 0 and d["cat_count"] > 0:
+                ui.label("All files are categorized.").classes("text-xs text-gray-400 italic")
+
+    _refresh_stats()
+
     def _update_status_ui():
         s = get_scan_meta("status", "idle")
         p = int(get_scan_meta("progress") or 0)
@@ -332,6 +466,7 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
             counter_label.set_text(f"{p} / {t} files")
             scan_btn.set_enabled(False)
             cancel_btn.set_visibility(True)
+            _refresh_stats()
         elif s == "cancelling":
             status_label.set_text("Cancelling…")
             scan_btn.set_enabled(False)
@@ -341,6 +476,7 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
             progress_bar.set_value(0)
             scan_btn.set_enabled(True)
             cancel_btn.set_visibility(False)
+            _refresh_stats()
         else:
             fresh_last_scan = get_scan_meta("last_scan")
             if fresh_last_scan:
@@ -351,6 +487,7 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
             counter_label.set_text(f"{t} files" if t else "")
             scan_btn.set_enabled(True)
             cancel_btn.set_visibility(False)
+            _refresh_stats()
 
     with ui.row().classes("gap-2 mt-2"):
 
@@ -370,13 +507,13 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
                 res = await loop.run_in_executor(None, _blocking)
                 state["suggestions"] = res["suggestions"]
                 state["ambiguous"] = res["ambiguous"]
-                state["suggestions_visible"] = 15  # reset pagination on fresh scan
+                state["suggestions_visible"] = int(
+                    get_setting("suggestions_page_size", "10")
+                )  # reset pagination on fresh scan
                 if "refresh_suggestions" in state:
                     state["refresh_suggestions"]()
                 tabs.set_value(tab_suggest)
-                ui.run_javascript(
-                    "history.replaceState(null, '', '/organize?tab=suggestions')", respond=False
-                )
+                ui.run_javascript("history.replaceState(null, '', '/organize?tab=suggestions')")
             except Exception as e:
                 set_scan_meta("status", "failed")
                 set_scan_meta("last_error", str(e))
@@ -421,7 +558,7 @@ def _render_suggestions(state: dict, container):
     dismissed_active = [s for s in suggestions if _is_dismissed(s)]
     active_suggestions = [s for s in suggestions if not _is_dismissed(s)]
 
-    _PAGE = 15
+    _PAGE = int(get_setting("suggestions_page_size", "10"))
     visible = state.get("suggestions_visible", _PAGE)
     for sugg in active_suggestions[:visible]:
         _render_suggestion_card(sugg, state, container, dismissed=False)
@@ -480,8 +617,6 @@ def _render_suggestions(state: dict, container):
 
 def _is_dismissed(sugg: dict) -> bool:
     from sqlalchemy import select
-
-    from .db import DismissedMatch
 
     # For add_to cards include the categorized folder(s) in the pair check
     folders = list(sugg.get("folders", []))
@@ -802,6 +937,73 @@ def _run_merge_with_preview(sources: list[str], dest_name: str, state: dict, con
     dlg.open()
 
 
+def _last_undoable_merge() -> dict | None:
+    from datetime import timedelta
+
+    cutoff = utcnow() - timedelta(minutes=30)
+    with get_session() as s:
+        log = s.execute(
+            select(MergeLog)
+            .where(
+                MergeLog.status == "done",
+                MergeLog.file_map.isnot(None),
+                MergeLog.completed_at >= cutoff,
+            )
+            .order_by(MergeLog.completed_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if log is None:
+            return None
+        return {
+            "id": log.id,
+            "dest": log.dest,
+            "sources": json.loads(log.sources),
+            "deleted_count": sum(1 for v in json.loads(log.file_map).values() if v is None),
+        }
+
+
+def _show_undo_confirm(merge: dict, state: dict, container):
+    from . import face as face_mod
+
+    sources_str = ", ".join(s.removeprefix("categorized/") for s in merge["sources"])
+    dest_str = merge["dest"].removeprefix("categorized/")
+    deleted = merge["deleted_count"]
+
+    with ui.dialog() as dlg, ui.card():
+        ui.label(f"Undo merge into '{dest_str}'?").classes("font-semibold")
+        ui.label(f"Files from: {sources_str}").classes("text-sm text-gray-500 mt-1")
+        if deleted:
+            ui.label(
+                f"{deleted} file(s) deleted as duplicates during merge cannot be restored."
+            ).classes("text-xs text-orange-500 mt-1")
+        ui.label("This will move all merged files back to their original folders.").classes(
+            "text-sm mt-2"
+        )
+
+        async def do_undo():
+            dlg.close()
+            loop = asyncio.get_running_loop()
+            error = await loop.run_in_executor(None, lambda: face_mod.undo_merge(merge["id"]))
+            if error:
+                ui.notify(f"Undo failed: {error}", color="negative")
+            else:
+                ui.notify(f"Undone — '{dest_str}' restored to original folders", color="positive")
+                state["suggestions"] = []
+                state["ambiguous"] = []
+                rm = state.get("recently_merged", [])
+                if dest_str in rm:
+                    rm.remove(dest_str)
+                if "refresh_suggestions" in state:
+                    state["refresh_suggestions"]()
+                if "refresh_categorized" in state:
+                    state["refresh_categorized"]()
+
+        with ui.row().classes("mt-3 gap-2 justify-end"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+            ui.button("Undo merge", on_click=do_undo).props("color=negative")
+    dlg.open()
+
+
 def _render_categorized(container, state: dict | None = None):
     from . import face as face_mod
 
@@ -818,6 +1020,7 @@ def _render_categorized(container, state: dict | None = None):
 
     # Merge people state
     merge_state: dict[str, Any] = {"selected": [], "mode": False}
+    last_merge = _last_undoable_merge()
 
     def enter_merge_mode():
         merge_state["mode"] = True
@@ -832,15 +1035,27 @@ def _render_categorized(container, state: dict | None = None):
         merge_bar.set_visibility(False)
         merge_btn.set_visibility(True)
 
-    with ui.row().classes("items-center justify-between w-full mb-2"):
-        ui.label(f"{len(people)} people").classes("text-sm text-gray-500")
-        merge_btn = ui.button("Merge people", icon="merge", on_click=enter_merge_mode).props("flat")
+    with ui.row().classes("items-center justify-between w-full mb-2 gap-2"):
+        ui.label(f"{len(people)} people").classes("text-sm text-gray-500 shrink-0")
+        filter_input = ui.input(placeholder="Filter...").classes("flex-1")
+        with ui.row().classes("gap-2 shrink-0"):
+            if last_merge:
+                ui.button(
+                    "Undo last merge",
+                    icon="undo",
+                    on_click=lambda: _show_undo_confirm(last_merge, state or {}, container),
+                ).props("flat color=negative")
+            merge_btn = ui.button("Merge people", icon="merge", on_click=enter_merge_mode).props(
+                "flat"
+            )
 
     with ui.row().classes("items-center gap-2 w-full bg-blue-50 p-2 rounded") as merge_bar:
         merge_status_label = ui.label("Select two people to merge").classes("text-sm flex-1")
         ui.button("Cancel", on_click=cancel_merge_mode).props("flat dense")
 
     merge_bar.set_visibility(False)
+
+    person_cards: dict[str, Any] = {}
 
     with ui.grid(columns=3).classes("w-full gap-4"):
         for person in people:
@@ -850,6 +1065,7 @@ def _render_categorized(container, state: dict | None = None):
             with ui.card().classes(
                 "w-full cursor-pointer hover:shadow-md transition-shadow"
             ) as card:
+                person_cards[person] = card
                 # Thumbnail grid
                 with ui.grid(columns=2).classes("w-full gap-1"):
                     for t in thumbs[:4]:
@@ -930,6 +1146,23 @@ def _render_categorized(container, state: dict | None = None):
 
                 card.on("click", make_select_handler(person))
 
+    async def on_filter_change():
+        await asyncio.sleep(0.15)
+        query = filter_input.value.strip().casefold()
+        if state is not None:
+            state["cat_filter"] = filter_input.value
+        for _p, _card in person_cards.items():
+            _card.set_visibility(not query or query in _p.casefold())
+        if merge_state["mode"]:
+            merge_state["selected"] = []
+            merge_status_label.set_text("Select two people to merge")
+
+    filter_input.on("update:model-value", lambda: asyncio.ensure_future(on_filter_change()))
+
+    if state is not None and (saved_filter := state.get("cat_filter")):
+        filter_input.set_value(saved_filter)
+        asyncio.ensure_future(on_filter_change())
+
 
 def _show_add_more(person: str, container, state: dict | None = None):
     """Show folder picker from downloads tree (excluding categorized/)."""
@@ -946,6 +1179,8 @@ def _show_add_more(person: str, container, state: dict | None = None):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         if abs_root != os.path.abspath(DOWNLOAD_DIR):
             source_folders.append(os.path.relpath(abs_root, DOWNLOAD_DIR))
+
+    source_folders.sort(key=str.casefold)
 
     with ui.dialog() as dlg, ui.card().classes("w-full max-w-lg"):
         ui.label(f"Add more to '{person}'").classes("font-semibold mb-2")
@@ -1091,8 +1326,169 @@ def _build_settings_tab():
         "text-xs text-gray-400 ml-8"
     )
 
+    ui.separator().classes("my-4")
+    ui.label("Suggestions").classes("text-lg font-semibold mb-2")
+
+    current_page_size = int(get_setting("suggestions_page_size", "10"))
+
+    with ui.row().classes("items-center gap-4 w-full mt-2"):
+        ui.label("Suggestions per page").classes("text-sm w-48")
+        page_size_label = ui.label(f"{current_page_size}").classes("text-sm w-12")
+
+    def on_page_size_change(e):
+        val = int(e.value)
+        set_setting("suggestions_page_size", str(val))
+        page_size_label.set_text(str(val))
+
+    ui.slider(
+        min=5, max=50, step=5, value=current_page_size, on_change=on_page_size_change
+    ).classes("w-full")
+
+    if PASSWORD:
+        ui.separator().classes("my-4")
+        ui.label("Security").classes("text-lg font-semibold mb-2")
+
+        current_auto_logout = int(get_setting("auto_logout_minutes", "15"))
+
+        with ui.row().classes("items-center gap-4 w-full mt-2"):
+            ui.label("Auto-logout after inactivity").classes("text-sm w-48")
+            auto_logout_label = ui.label(
+                f"{current_auto_logout} min" if current_auto_logout > 0 else "disabled"
+            ).classes("text-sm w-20")
+
+        def on_auto_logout_change(e):
+            val = int(e.value)
+            set_setting("auto_logout_minutes", str(val))
+            auto_logout_label.set_text(f"{val} min" if val > 0 else "disabled")
+
+        ui.slider(
+            min=0, max=120, step=5, value=current_auto_logout, on_change=on_auto_logout_change
+        ).classes("w-full")
+        ui.label("Set to 0 to disable. Change takes effect on next page load.").classes(
+            "text-xs text-gray-400"
+        )
+
 
 # ── Gallery page ──────────────────────────────────────────────────────────────
+
+
+def _delete_gallery_file(person: str, rel_path: str) -> str | None:
+    """Delete a gallery file from disk and DB. Returns error string or None."""
+    from . import face as face_mod
+
+    cat_abs = os.path.abspath(_categorized_dir())
+    person_abs = os.path.abspath(os.path.join(cat_abs, person))
+    if not person_abs.startswith(cat_abs + os.sep):
+        return "Invalid person name"
+
+    abs_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, rel_path))
+    if not abs_path.startswith(person_abs + os.sep):
+        return "Invalid file path"
+
+    try:
+        os.remove(abs_path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return f"Delete failed: {e}"
+
+    thumb = _thumb_path(rel_path)
+    if os.path.exists(thumb):
+        try:
+            os.remove(thumb)
+        except OSError:
+            pass
+
+    with get_session() as s:
+        s.execute(delete(ImageMeta).where(ImageMeta.file_path == rel_path))
+        s.execute(delete(FaceEmbedding).where(FaceEmbedding.file_path == rel_path))
+        s.commit()
+
+    try:
+        face_mod._recompute_centroids(get_setting("face_model", "buffalo_s"))
+    except Exception:
+        pass
+
+    return None
+
+
+def _render_gallery_grid(person: str, images: list[dict], container) -> None:
+    container.clear()
+    with container:
+        if not images:
+            ui.label("No files remaining.").classes("text-gray-500 py-8")
+            return
+
+        _thumb_style = "width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;cursor:pointer"
+        _grid_style = (
+            "display:grid;"
+            "grid-template-columns:repeat(auto-fill,minmax(160px,1fr));"
+            "gap:8px;width:100%"
+        )
+
+        with ui.element("div").style(_grid_style).props("id=lg-gallery"):
+            for img in images:
+                thumb_html = f'<img src="{img["thumb"]}" style="{_thumb_style}" />'
+                if img.get("is_video"):
+                    video_data = json.dumps(
+                        {
+                            "source": [{"src": img["src"], "type": img["video_type"]}],
+                            "attributes": {"preload": "none", "controls": True},
+                        }
+                    )
+                    item_html = f"<a class=\"lg-item\" data-video='{video_data}'>{thumb_html}</a>"
+                else:
+                    item_html = f'<a href="{img["src"]}" class="lg-item">{thumb_html}</a>'
+
+                with ui.element("div").classes("relative group"):
+                    ui.html(item_html)
+
+                    def make_delete_handler(rel=img["rel"]):
+                        async def on_delete():
+                            with ui.dialog() as dlg, ui.card():
+                                ui.label(f"Delete '{os.path.basename(rel)}'?").classes(
+                                    "font-semibold"
+                                )
+                                ui.label("This cannot be undone.").classes(
+                                    "text-sm text-gray-500 mt-1"
+                                )
+
+                                async def do_delete():
+                                    dlg.close()
+                                    await ui.run_javascript(
+                                        "if (window.lgInstance) {"
+                                        "  window.lgInstance.destroy();"
+                                        "  window.lgInstance = null;"
+                                        "}"
+                                    )
+                                    loop = asyncio.get_running_loop()
+                                    err = await loop.run_in_executor(
+                                        None, _delete_gallery_file, person, rel
+                                    )
+                                    if err:
+                                        ui.notify(f"Delete failed: {err}", color="negative")
+                                    else:
+                                        ui.notify("File deleted", color="positive")
+                                    new_imgs = _person_images(person)
+                                    _render_gallery_grid(person, new_imgs, container)
+                                    await ui.run_javascript(_LG_INIT_JS)
+
+                                with ui.row().classes("mt-3 gap-2 justify-end"):
+                                    ui.button("Cancel", on_click=dlg.close).props("flat")
+                                    ui.button("Delete", on_click=do_delete).props("color=negative")
+                            dlg.open()
+
+                        return on_delete
+
+                    (
+                        ui.button(icon="delete_outline", on_click=make_delete_handler())
+                        .props("flat round dense size=xs color=negative")
+                        .classes(
+                            "absolute top-1 right-1 opacity-0"
+                            " group-hover:opacity-100 transition-opacity"
+                        )
+                        .style("background: rgba(255,255,255,0.85)")
+                    )
 
 
 @ui.page("/gallery/{person}")
@@ -1101,7 +1497,42 @@ def gallery_page(person: str):
         ui.navigate.to("/login")
         return
 
+    # Path traversal guard
+    cat_abs = os.path.abspath(_categorized_dir())
+    person_abs = os.path.abspath(os.path.join(cat_abs, person))
+    if not person_abs.startswith(cat_abs + os.sep):
+        ui.notify("Invalid person name", color="negative")
+        ui.navigate.to("/organize?tab=categorized")
+        return
+
     ui.page_title(f"{person} — Gallery")
+    ui.add_body_html(_auto_logout_js())
+    dark = ui.dark_mode()
+    dark.set_value(app.storage.user.get("dark_mode", False))
+
+    def _toggle_dark(dark=dark):
+        new_val = not dark.value
+        dark.set_value(new_val)
+        app.storage.user["dark_mode"] = new_val
+
+    # CDN scripts go in <head> so they execute (innerHTML scripts are blocked by browsers)
+    ui.add_head_html(
+        '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lightgallery@2/css/lightgallery-bundle.min.css">'
+    )
+    ui.add_head_html(
+        '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/lightgallery.umd.min.js"></script>'
+    )
+    ui.add_head_html(
+        '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/plugins/zoom/lg-zoom.umd.min.js"></script>'
+    )
+    ui.add_head_html(
+        '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/plugins/thumbnail/lg-thumbnail.umd.min.js"></script>'
+    )
+    ui.add_head_html(
+        '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/plugins/video/lg-video.umd.min.js"></script>'
+    )
+    ui.add_head_html(f"<script>{_LG_INIT_JS}</script>")
+
     images = _person_images(person)
 
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
@@ -1111,69 +1542,17 @@ def gallery_page(person: str):
                 icon="arrow_back",
                 on_click=lambda: ui.navigate.to("/organize?tab=categorized"),
             ).props("flat dense")
-            ui.label(person).classes("text-xl font-bold")
+            ui.label(person).classes("text-xl font-bold flex-1")
             ui.label(f"({len(images)} file{'s' if len(images) != 1 else ''})").classes(
                 "text-sm text-gray-400"
+            )
+            ui.button(icon="dark_mode", on_click=_toggle_dark).props("flat round").tooltip(
+                "Toggle dark mode"
             )
 
         if not images:
             ui.label("No files found.").classes("text-gray-500 py-8")
             return
 
-        # CSS and JS libs go in <head> — scripts added there actually execute,
-        # unlike <script> tags inside ui.html() which Vue renders via innerHTML
-        # and the browser ignores for security reasons.
-        ui.add_head_html(
-            '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lightgallery@2/css/lightgallery-bundle.min.css">'
-        )
-        ui.add_head_html(
-            '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/lightgallery.umd.min.js"></script>'
-        )
-        ui.add_head_html(
-            '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/plugins/zoom/lg-zoom.umd.min.js"></script>'
-        )
-        ui.add_head_html(
-            '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/plugins/thumbnail/lg-thumbnail.umd.min.js"></script>'
-        )
-        ui.add_head_html(
-            '<script src="https://cdn.jsdelivr.net/npm/lightgallery@2/plugins/video/lg-video.umd.min.js"></script>'
-        )
-        # Init retries until Vue has mounted #lg-gallery in the DOM.
-        ui.add_head_html(
-            "<script>"
-            "(function tryInit() {"
-            "  var el = document.getElementById('lg-gallery');"
-            "  if (!el || !window.lightGallery) { setTimeout(tryInit, 100); return; }"
-            "  lightGallery(el, {"
-            "    plugins: [lgZoom, lgThumbnail, lgVideo],"
-            "    speed: 300,"
-            "    download: true,"
-            "    selector: '.lg-item',"
-            "  });"
-            "})();"
-            "</script>"
-        )
-
-        thumb_style = "width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;cursor:pointer"
-        items_html = ""
-        for img in images:
-            thumb_img = f'<img src="{img["thumb"]}" style="{thumb_style}" />'
-            if img.get("is_video"):
-                video_data = json.dumps(
-                    {
-                        "source": [{"src": img["src"], "type": img["video_type"]}],
-                        "attributes": {"preload": "none", "controls": True},
-                    }
-                )
-                # Use single-quoted attr so inner JSON double-quotes are safe
-                items_html += f"<a class=\"lg-item\" data-video='{video_data}'>{thumb_img}</a>"
-            else:
-                items_html += f'<a href="{img["src"]}" class="lg-item">{thumb_img}</a>'
-        _grid_style = (
-            "display:grid;"
-            "grid-template-columns:repeat(auto-fill,minmax(160px,1fr));"
-            "gap:8px;width:100%"
-        )
-        ui.html(f'<div id="lg-gallery" style="{_grid_style}">{items_html}</div>').classes(
-            "w-full block"
-        )
+        gallery_container = ui.column().classes("w-full")
+        _render_gallery_grid(person, images, gallery_container)

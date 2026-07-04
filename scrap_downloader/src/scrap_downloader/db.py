@@ -82,6 +82,7 @@ class ImageMeta(Base):
     sha256: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     face_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_face_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     file_mtime: Mapped[float | None] = mapped_column(Float, nullable=True)
     scanned_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -154,6 +155,7 @@ class MergeLog(Base):
     status: Mapped[str] = mapped_column(String, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    file_map: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
@@ -165,6 +167,8 @@ _SETTING_DEFAULTS: dict[str, str] = {
     "min_images_per_folder": "3",
     "mini_scan_enabled": "true",
     "unknown_counter": "0",
+    "suggestions_page_size": "10",
+    "auto_logout_minutes": "15",
 }
 
 
@@ -210,6 +214,18 @@ def init_db() -> None:
     with engine.connect() as conn:
         try:
             conn.execute(text("ALTER TABLE tasks ADD COLUMN completed_at DATETIME"))
+            conn.commit()
+        except Exception:
+            pass
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE image_meta ADD COLUMN file_size INTEGER"))
+            conn.commit()
+        except Exception:
+            pass
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE merge_log ADD COLUMN file_map TEXT"))
             conn.commit()
         except Exception:
             pass
