@@ -240,3 +240,75 @@ def test_suggestion_card_no_typed_text_tracking():
         "typed_text tracking has been removed from _render_suggestion_card. "
         "Use ui.input (always-synced value) instead of event-based tracking."
     )
+
+
+# ── Performance: hoist _list_people / lazy chip previews ─────────────────────
+#
+# _render_suggestion_card is called once per visible suggestion.  Two patterns
+# were costing O(N) DB queries per render cycle:
+#   1. _list_people() called inside the card → N queries per render
+#   2. _person_sample_thumbs() called for every chip in every card during
+#      initial render, even though previews start hidden → 6N queries per render
+#
+# Fixes: (1) hoist _list_people() into _render_suggestions and pass it down as
+# existing_people; (2) populate chip preview rows lazily inside _chip_select on
+# first click.
+
+
+def test_render_suggestion_card_accepts_existing_people():
+    """_render_suggestion_card must accept existing_people param to allow hoisting _list_people."""
+    _, src = _parse_organize()
+    start = src.index("def _render_suggestion_card")
+    # Capture through the closing paren+colon of the signature (skip type annotation colons)
+    paren_close = src.index("):", start)
+    sig_src = src[start : paren_close + 2]
+    assert "existing_people" in sig_src, (
+        "_render_suggestion_card must have an existing_people parameter so _render_suggestions "
+        "can call _list_people() once and pass it to each card, avoiding N DB queries per render."
+    )
+
+
+def test_chip_previews_populated_lazily():
+    """_person_sample_thumbs must only be called inside _chip_select, not at render time.
+
+    Pre-fetching all chip preview thumbnails during initial card render costs up to
+    6 DB queries per suggestion card even though previews start hidden.  The fix
+    populates each preview lazily — only when the user actually clicks that chip.
+    """
+    _, src = _parse_organize()
+    start = src.index("def _render_suggestion_card")
+    rest = src[start:]
+    next_def = rest.find("\ndef ", 1)
+    card_src = rest[:next_def] if next_def != -1 else rest
+
+    chip_select_start = card_src.find("def _chip_select")
+    assert chip_select_start != -1, "_chip_select not found inside _render_suggestion_card"
+
+    before_chip_select = card_src[:chip_select_start]
+    assert "_person_sample_thumbs" not in before_chip_select, (
+        "_person_sample_thumbs must not be called before _chip_select is defined. "
+        "Chip previews must be populated lazily on click to avoid blocking the render loop."
+    )
+
+
+# ── Cache-control: /thumbs/ must set immutable headers ───────────────────────
+#
+# NiceGUI's add_static_files() uses Starlette StaticFiles which omits
+# Cache-Control: max-age, so the browser re-validates thumbnails on every
+# re-render after a merge.  Thumb filenames are SHA256 hashes of their rel
+# path, making them safe to cache indefinitely — a content change produces a
+# new hash (new URL), so immutable is correct.
+
+
+def test_thumbs_route_sets_immutable_cache_header():
+    """The /thumbs/ route must set Cache-Control: immutable to prevent reload on re-render."""
+    import inspect
+
+    import scrap_downloader.main as main_mod
+
+    src = inspect.getsource(main_mod)
+    assert "Cache-Control" in src, "main.py must set a Cache-Control header on /thumbs/ responses."
+    assert "immutable" in src, (
+        "main.py must include 'immutable' in the Cache-Control header for /thumbs/ so the "
+        "browser serves thumbnails from disk cache without re-validating after each merge."
+    )

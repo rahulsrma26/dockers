@@ -411,9 +411,12 @@ def main_page():
                 with ui.tab_panel(tab_auto):
                     url_input = ui.input("URL", placeholder="https://...").classes("w-full")
                     tag_input = ui.input("Tag", placeholder="my-album").classes("w-full")
-                    auto_audio_only = ui.switch(
-                        "Audio only (best quality, original format)"
-                    ).classes("mt-2")
+
+                    ui.label("Media type").classes("text-sm text-gray-500 mt-2")
+                    auto_media = ui.toggle(
+                        {"": "All", "images": "Images only", "videos": "Videos only"},
+                        value="",
+                    )
 
                     def submit_auto():
                         url = url_input.value.strip()
@@ -422,7 +425,7 @@ def main_page():
                             ui.notify("URL and tag are required", color="negative")
                             return
                         touch_activity()
-                        audio_only = auto_audio_only.value
+                        media_type = auto_media.value
 
                         def do_queue():
                             with get_session() as session:
@@ -430,8 +433,10 @@ def main_page():
                                     Task(
                                         url=url,
                                         tag=tag,
-                                        tool=TaskTool.ytdlp if audio_only else TaskTool.auto,
-                                        extra_args="--audio-only" if audio_only else None,
+                                        tool=TaskTool.auto,
+                                        extra_args=f"--media-type {media_type}"
+                                        if media_type
+                                        else None,
                                         status=TaskStatus.pending,
                                         progress=0.0,
                                     )
@@ -620,7 +625,20 @@ def main():
     DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
     thumbs_dir = os.path.join(DOWNLOAD_DIR, ".thumbs")
     os.makedirs(thumbs_dir, exist_ok=True)
-    app.add_static_files("/thumbs", thumbs_dir)
+
+    @app.get("/thumbs/{filename}")
+    async def _serve_thumb(filename: str):
+        from fastapi import HTTPException
+        from fastapi.responses import FileResponse
+
+        safe = os.path.basename(filename)
+        if safe != filename or not safe:
+            raise HTTPException(status_code=400)
+        path = os.path.join(thumbs_dir, safe)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404)
+        return FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
     app.add_static_files("/files", DOWNLOAD_DIR)
 
     # Register organize page

@@ -11,7 +11,7 @@ from collections import defaultdict
 from typing import Callable
 
 import numpy as np
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from .db import (
     DismissedMatch,
@@ -21,6 +21,7 @@ from .db import (
     MergeLog,
     Notification,
     Setting,
+    Tag,
     get_scan_meta,
     get_session,
     get_setting,
@@ -46,6 +47,16 @@ _MEDIA_EXTS = _IMAGE_EXTS | {
     ".m4a",
     ".opus",
     ".flac",
+}
+_VIDEO_MIME: dict[str, str] = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mkv": "video/mp4",
+    ".avi": "video/mp4",
+    ".mov": "video/mp4",
+    ".flv": "video/mp4",
+    ".m4v": "video/mp4",
+    ".wmv": "video/mp4",
 }
 
 _scan_lock = threading.Lock()
@@ -135,6 +146,10 @@ def _categorized_dir() -> str:
     return os.path.join(DOWNLOAD_DIR, "categorized")
 
 
+def _collections_dir() -> str:
+    return os.path.join(DOWNLOAD_DIR, "collections")
+
+
 def _rel(path: str) -> str:
     return os.path.relpath(path, DOWNLOAD_DIR)
 
@@ -162,6 +177,222 @@ def _generate_thumb(image_path: str, rel_path: str) -> None:
         img = img.convert("RGB")
         img.thumbnail((256, 256))
         img.save(out_path, "JPEG", quality=80)
+
+
+# ── Tag CRUD ──────────────────────────────────────────────────────────────────
+
+
+def add_tag(entity_type: str, entity_name: str, tag: str) -> None:
+    tag = tag.strip().lower()
+    if not tag:
+        return
+    with get_session() as s:
+        existing = s.execute(
+            select(Tag).where(
+                Tag.entity_type == entity_type,
+                Tag.entity_name == entity_name,
+                Tag.tag == tag,
+            )
+        ).scalar_one_or_none()
+        if not existing:
+            s.add(Tag(entity_type=entity_type, entity_name=entity_name, tag=tag))
+        s.commit()
+
+
+def remove_tag(entity_type: str, entity_name: str, tag: str) -> None:
+    with get_session() as s:
+        s.execute(
+            delete(Tag).where(
+                Tag.entity_type == entity_type,
+                Tag.entity_name == entity_name,
+                Tag.tag == tag,
+            )
+        )
+        s.commit()
+
+
+def get_tags(entity_type: str, entity_name: str) -> list[str]:
+    with get_session() as s:
+        rows = (
+            s.execute(
+                select(Tag.tag)
+                .where(Tag.entity_type == entity_type, Tag.entity_name == entity_name)
+                .order_by(Tag.tag)
+            )
+            .scalars()
+            .all()
+        )
+    return list(rows)
+
+
+def get_all_tags(entity_type: str) -> dict[str, list[str]]:
+    """Bulk-load all tags for an entity type — one query instead of N per card."""
+    with get_session() as s:
+        rows = s.execute(select(Tag).where(Tag.entity_type == entity_type)).scalars().all()
+    result: dict[str, list[str]] = {}
+    for row in rows:
+        result.setdefault(row.entity_name, []).append(row.tag)
+    for v in result.values():
+        v.sort()
+    return result
+
+
+def list_all_tags(entity_type: str) -> list[str]:
+    with get_session() as s:
+        rows = (
+            s.execute(
+                select(Tag.tag).where(Tag.entity_type == entity_type).distinct().order_by(Tag.tag)
+            )
+            .scalars()
+            .all()
+        )
+    return list(rows)
+
+
+def rename_entity_tags(entity_type: str, old_name: str, new_name: str) -> None:
+    """Migrate tag rows when a person or collection is renamed."""
+    with get_session() as s:
+        s.execute(
+            update(Tag)
+            .where(Tag.entity_type == entity_type, Tag.entity_name == old_name)
+            .values(entity_name=new_name)
+        )
+        s.commit()
+
+
+# ── Animated GIF thumbnails ───────────────────────────────────────────────────
+
+
+def _gif_key(entity_rel: str) -> str:
+    return hashlib.sha256(f"animated:{entity_rel}".encode()).hexdigest()
+
+
+def _gif_path(entity_rel: str) -> str:
+    return os.path.join(_thumbs_dir(), _gif_key(entity_rel) + ".gif")
+
+
+def _invalidate_gif(entity_rel: str) -> None:
+    p = _gif_path(entity_rel)
+    if os.path.exists(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _generate_animated_gif(entity_rel: str, thumb_paths: list[str]) -> None:
+    """Stitch up to 4 thumbs into an animated GIF (800 ms/frame, infinite loop). Executor-only."""
+    from PIL import Image, ImageOps
+
+    size = 320
+    frames: list[Image.Image] = []
+    for path in thumb_paths[:4]:
+        try:
+            with Image.open(path) as img:
+                frames.append(ImageOps.fit(img.convert("RGB"), (size, size), method=Image.LANCZOS))
+        except Exception:
+            pass
+    if not frames:
+        _invalidate_gif(entity_rel)
+        return
+    out = _gif_path(entity_rel)
+    os.makedirs(_thumbs_dir(), exist_ok=True)
+    frames[0].save(
+        out,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        loop=0,
+        duration=800,
+    )
+
+
+def regenerate_person_gif(person_name: str) -> None:
+    """Pick best 4 thumb paths for a person and regenerate animated GIF. Executor-only."""
+    entity_rel = f"categorized/{person_name}"
+    pattern = _like_prefix(entity_rel)
+    with get_session() as s:
+        rows = (
+            s.execute(
+                select(ImageMeta)
+                .where(ImageMeta.file_path.like(pattern, escape="\\"))
+                .order_by(ImageMeta.max_face_ratio.desc().nulls_last())
+                .limit(4)
+            )
+            .scalars()
+            .all()
+        )
+    paths = [_thumb_path(r.file_path) for r in rows if os.path.isfile(_thumb_path(r.file_path))]
+    if paths:
+        _generate_animated_gif(entity_rel, paths)
+    else:
+        _invalidate_gif(entity_rel)
+
+
+def regenerate_collection_gif(coll_name: str) -> None:
+    """Pick first 4 media thumb paths in a collection and regenerate animated GIF. Executor-only."""
+    entity_rel = f"collections/{coll_name}"
+    coll_abs = os.path.join(_collections_dir(), coll_name)
+    if not os.path.isdir(coll_abs):
+        _invalidate_gif(entity_rel)
+        return
+    paths = []
+    for fname in sorted(os.listdir(coll_abs)):
+        if len(paths) >= 4:
+            break
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in _MEDIA_EXTS:
+            continue
+        rel = f"{entity_rel}/{fname}"
+        tp = _thumb_path(rel)
+        if os.path.isfile(tp):
+            paths.append(tp)
+    if paths:
+        _generate_animated_gif(entity_rel, paths)
+    else:
+        _invalidate_gif(entity_rel)
+
+
+def get_gif_url(entity_rel: str, fallback_rels: list[str]) -> str:
+    """Return animated GIF URL if it exists, else first fallback URL, else empty string.
+
+    Pure filesystem stat — safe to call from the event loop.
+    """
+    gp = _gif_path(entity_rel)
+    if os.path.isfile(gp):
+        return f"/thumbs/{_gif_key(entity_rel)}.gif"
+    if fallback_rels:
+        return fallback_rels[0]
+    return ""
+
+
+def warmup_missing_gifs() -> None:
+    """Generate animated GIFs for all persons/collections that don't have one yet. Executor-only."""
+    cat_dir = _categorized_dir()
+    if os.path.isdir(cat_dir):
+        for name in os.listdir(cat_dir):
+            if name.startswith("."):
+                continue
+            if not os.path.isdir(os.path.join(cat_dir, name)):
+                continue
+            if not os.path.isfile(_gif_path(f"categorized/{name}")):
+                try:
+                    regenerate_person_gif(name)
+                except Exception:
+                    pass
+
+    coll_dir = _collections_dir()
+    if os.path.isdir(coll_dir):
+        for name in os.listdir(coll_dir):
+            if name.startswith("."):
+                continue
+            if not os.path.isdir(os.path.join(coll_dir, name)):
+                continue
+            if not os.path.isfile(_gif_path(f"collections/{name}")):
+                try:
+                    regenerate_collection_gif(name)
+                except Exception:
+                    pass
 
 
 # ── scan_dir ──────────────────────────────────────────────────────────────────
@@ -203,10 +434,15 @@ def _scan_dir_locked(path: str, on_progress) -> dict:
     set_scan_meta("status", "running")
     set_scan_meta("last_error", None)
 
-    # Collect all files
+    # Collect all files (excluding collections/ subtree)
+    coll_abs = os.path.abspath(_collections_dir())
     all_files = []
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        dirs[:] = [
+            d
+            for d in dirs
+            if not d.startswith(".") and os.path.abspath(os.path.join(root, d)) != coll_abs
+        ]
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext in _MEDIA_EXTS:
@@ -572,8 +808,9 @@ def analyse_downloads(path: str) -> dict:
 
 def _phase1_prefix_groups(path: str, face_threshold: float) -> tuple[list[dict], set[str]]:
     """Group files by common filename prefix within the same directory."""
-    # Walk non-categorized tree
+    # Walk non-categorized, non-collections tree
     cat_dir = _categorized_dir()
+    coll_dir = _collections_dir()
     groups: dict[tuple[str, str], list[str]] = defaultdict(list)
 
     for root, dirs, files in os.walk(path):
@@ -582,6 +819,7 @@ def _phase1_prefix_groups(path: str, face_threshold: float) -> tuple[list[dict],
             for d in dirs
             if not d.startswith(".")
             and os.path.abspath(os.path.join(root, d)) != os.path.abspath(cat_dir)
+            and os.path.abspath(os.path.join(root, d)) != os.path.abspath(coll_dir)
         ]
         for fname in sorted(files):
             fpath = os.path.join(root, fname)
@@ -628,7 +866,7 @@ def _phase1_prefix_groups(path: str, face_threshold: float) -> tuple[list[dict],
                             sims.append(_cosine_sim(e1, e2))
             confidence = float(np.mean(sims)) if sims else None
 
-        sample_thumbs = _pick_sample_thumbs(image_files, n=6)
+        sample_thumbs = _pick_sample_thumbs(image_files, n=24)
 
         folder_rel = os.path.relpath(parent_dir, DOWNLOAD_DIR)
         suggestions.append(
@@ -667,6 +905,8 @@ def _phase2_face_clustering(
         dismissed_pairs: set[tuple[str, str]] = {(r.folder_a, r.folder_b) for r in dismissed_rows}
 
     for row in all_emb_rows:
+        if row.file_path.startswith("collections/"):
+            continue  # collections are excluded from face analysis
         if row.file_path.startswith("categorized/"):
             folder = os.path.dirname(row.file_path)
             cat_folder_embeddings[folder].append(_bytes_to_embedding(row.embedding))
@@ -1237,6 +1477,8 @@ def merge_into(
             log.file_map = json.dumps(file_map)
         s.commit()
 
+    regenerate_person_gif(dest_name)
+
 
 def _remove_empty_dirs(path: str) -> None:
     download_abs = os.path.abspath(DOWNLOAD_DIR)
@@ -1315,6 +1557,9 @@ def undo_merge(log_id: int) -> str | None:
     # Clean up dest folder if now empty
     dest_abs = os.path.abspath(os.path.join(_categorized_dir(), dest))
     _remove_empty_dirs(dest_abs)
+
+    _invalidate_gif(f"categorized/{dest}")
+    regenerate_person_gif(dest)
 
     # Recompute centroids — covers both dest and restored source folders
     _recompute_centroids(get_setting("face_model", "buffalo_s"))
@@ -1423,6 +1668,23 @@ def rename_person(old_name: str, new_name: str) -> str | None:
                 s.add(DismissedMatch(folder_a=fa, folder_b=fb))
                 existing_pairs.add((fa, fb))
         s.commit()
+
+    # Rename thumbnails: SHA256 of rel changes when the person name changes
+    new_path = os.path.join(_categorized_dir(), new_name)
+    old_prefix = f"categorized/{old_name}/"
+    new_prefix = f"categorized/{new_name}/"
+    for fname in list(os.listdir(new_path)):
+        old_thumb = _thumb_path(f"{old_prefix}{fname}")
+        new_thumb = _thumb_path(f"{new_prefix}{fname}")
+        if os.path.exists(old_thumb):
+            try:
+                os.rename(old_thumb, new_thumb)
+            except OSError:
+                pass  # non-fatal; thumb regenerated on next scan
+
+    _invalidate_gif(f"categorized/{old_name}")
+    regenerate_person_gif(new_name)
+    rename_entity_tags("person", old_name, new_name)
 
     return None
 
@@ -1535,34 +1797,59 @@ def scan_new_download(folder: str) -> None:
 
 
 def dismiss_suggestion(folders: list[str]) -> None:
-    """Store all pairs from folders as dismissed_matches rows."""
+    """Store all pairs from folders as dismissed_matches rows.
+
+    Single-folder suggestions (e.g. series) use a self-pair (f, f) as sentinel.
+    """
+    if not folders:
+        return
     with get_session() as s:
-        for i in range(len(folders)):
-            for j in range(i + 1, len(folders)):
-                a, b = _normalize_pair(folders[i], folders[j])
-                existing = s.execute(
-                    select(DismissedMatch).where(
-                        DismissedMatch.folder_a == a,
-                        DismissedMatch.folder_b == b,
-                    )
-                ).scalar_one_or_none()
-                if not existing:
-                    s.add(DismissedMatch(folder_a=a, folder_b=b))
+        if len(folders) == 1:
+            f = folders[0]
+            existing = s.execute(
+                select(DismissedMatch).where(
+                    DismissedMatch.folder_a == f, DismissedMatch.folder_b == f
+                )
+            ).scalar_one_or_none()
+            if not existing:
+                s.add(DismissedMatch(folder_a=f, folder_b=f))
+        else:
+            for i in range(len(folders)):
+                for j in range(i + 1, len(folders)):
+                    a, b = _normalize_pair(folders[i], folders[j])
+                    existing = s.execute(
+                        select(DismissedMatch).where(
+                            DismissedMatch.folder_a == a,
+                            DismissedMatch.folder_b == b,
+                        )
+                    ).scalar_one_or_none()
+                    if not existing:
+                        s.add(DismissedMatch(folder_a=a, folder_b=b))
         s.commit()
 
 
 def undismiss_suggestion(folders: list[str]) -> None:
     """Remove all pair rows for this group from dismissed_matches."""
+    if not folders:
+        return
     with get_session() as s:
-        for i in range(len(folders)):
-            for j in range(i + 1, len(folders)):
-                a, b = _normalize_pair(folders[i], folders[j])
-                s.execute(
-                    delete(DismissedMatch).where(
-                        DismissedMatch.folder_a == a,
-                        DismissedMatch.folder_b == b,
-                    )
+        if len(folders) == 1:
+            f = folders[0]
+            s.execute(
+                delete(DismissedMatch).where(
+                    DismissedMatch.folder_a == f, DismissedMatch.folder_b == f
                 )
+            )
+        else:
+            for i in range(len(folders)):
+                for j in range(i + 1, len(folders)):
+                    a, b = _normalize_pair(folders[i], folders[j])
+                    s.execute(
+                        delete(DismissedMatch).where(
+                            DismissedMatch.folder_a == a,
+                            DismissedMatch.folder_b == b,
+                        )
+                    )
         s.commit()
 
 
@@ -1578,3 +1865,259 @@ def next_unknown_name() -> str:
             s.add(Setting(key="unknown_counter", value=str(next_val)))
         s.commit()
     return f"unknown-{next_val}"
+
+
+# ── Collections ───────────────────────────────────────────────────────────────
+
+
+def list_collections() -> list[str]:
+    """Return sorted list of collection names (dirs under collections/)."""
+    d = _collections_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(
+        (n for n in os.listdir(d) if os.path.isdir(os.path.join(d, n)) and not n.startswith(".")),
+        key=str.casefold,
+    )
+
+
+def _collection_images(collection_name: str) -> list[dict]:
+    """Return all media files in a collection as lightGallery-ready dicts."""
+    coll_abs = os.path.abspath(_collections_dir())
+    folder_abs = os.path.abspath(os.path.join(coll_abs, collection_name))
+    if not folder_abs.startswith(coll_abs + os.sep):
+        return []
+    if not os.path.isdir(folder_abs):
+        return []
+    result = []
+    for fname in sorted(os.listdir(folder_abs)):
+        abs_path = os.path.join(folder_abs, fname)
+        if not os.path.isfile(abs_path):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in _MEDIA_EXTS:
+            continue
+        rel = f"collections/{collection_name}/{fname}"
+        item: dict = {
+            "rel": rel,
+            "src": f"/files/{rel}",
+            "thumb": f"/thumbs/{hashlib.sha256(rel.encode()).hexdigest()}.jpg",
+            "filename": fname,
+        }
+        if ext not in _IMAGE_EXTS:
+            item["is_video"] = True
+            item["video_type"] = _VIDEO_MIME.get(ext, "video/mp4")
+        result.append(item)
+    return result
+
+
+def rename_collection(old_name: str, new_name: str) -> str | None:
+    """Rename a collection folder and update its thumbnails. Returns error or None."""
+    new_name = new_name.strip()
+    if not new_name:
+        return "Name cannot be empty"
+    if new_name.startswith("."):
+        return "Name cannot start with a dot"
+    illegal = set('/\\:*?"<>|')
+    if illegal & set(new_name):
+        return f"Illegal characters: {''.join(sorted(illegal & set(new_name)))}"
+
+    coll_abs = os.path.abspath(_collections_dir())
+    old_abs = os.path.abspath(os.path.join(coll_abs, old_name))
+    new_abs = os.path.abspath(os.path.join(coll_abs, new_name))
+
+    if not old_abs.startswith(coll_abs + os.sep):
+        return "Invalid collection name"
+    if not new_abs.startswith(coll_abs + os.sep):
+        return "Invalid new name"
+    if not os.path.isdir(old_abs):
+        return f"Collection '{old_name}' not found"
+    if os.path.exists(new_abs):
+        return f"'{new_name}' already exists"
+
+    os.rename(old_abs, new_abs)
+
+    # Rename thumbnails: SHA256 of rel changes when the collection name changes
+    old_prefix = f"collections/{old_name}/"
+    new_prefix = f"collections/{new_name}/"
+    for fname in list(os.listdir(new_abs)):
+        old_rel = f"{old_prefix}{fname}"
+        new_rel = f"{new_prefix}{fname}"
+        old_thumb = _thumb_path(old_rel)
+        new_thumb = _thumb_path(new_rel)
+        if os.path.exists(old_thumb):
+            try:
+                os.rename(old_thumb, new_thumb)
+            except OSError:
+                pass  # non-fatal; thumb stays missing until next move
+
+    _invalidate_gif(f"collections/{old_name}")
+    regenerate_collection_gif(new_name)
+    rename_entity_tags("collection", old_name, new_name)
+
+    return None
+
+
+def delete_collection_file(collection_name: str, rel_path: str) -> str | None:
+    """Delete a file from a collection and its thumbnail. Returns error or None."""
+    coll_abs = os.path.abspath(_collections_dir())
+    coll_name_abs = os.path.abspath(os.path.join(coll_abs, collection_name))
+    if not coll_name_abs.startswith(coll_abs + os.sep):
+        return "Invalid collection name"
+
+    abs_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, rel_path))
+    if not abs_path.startswith(coll_name_abs + os.sep):
+        return "Invalid file path"
+
+    try:
+        os.remove(abs_path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return f"Delete failed: {e}"
+
+    thumb = _thumb_path(rel_path)
+    if os.path.exists(thumb):
+        try:
+            os.remove(thumb)
+        except OSError:
+            pass
+
+    # Auto-remove the collection folder if it is now empty
+    try:
+        _remove_empty_dirs(coll_name_abs)
+    except OSError:
+        pass
+
+    regenerate_collection_gif(collection_name)
+
+    return None
+
+
+def move_to_collection(source_rel: str, collection_name: str) -> str | None:
+    """Move all files from source_rel folder into collections/<collection_name>.
+
+    Moves ALL files (media + non-media) so the source dir can be fully cleaned up.
+    Generates thumbnails for media files immediately.
+    Cleans stale ImageMeta rows for the moved folder without a full scan.
+    Returns None on success, error string on failure.
+    """
+    import shutil
+
+    # Validate collection_name
+    illegal = set('/\\:*?"<>|')
+    collection_name = collection_name.strip()
+    if not collection_name:
+        return "Collection name cannot be empty"
+    if collection_name.startswith("."):
+        return "Collection name cannot start with a dot"
+    if illegal & set(collection_name):
+        return f"Illegal characters in name: {''.join(sorted(illegal & set(collection_name)))}"
+
+    # Validate source path
+    coll_abs = os.path.abspath(_collections_dir())
+    cat_abs = os.path.abspath(_categorized_dir())
+    dl_abs = os.path.abspath(DOWNLOAD_DIR)
+
+    src_abs = os.path.abspath(os.path.join(DOWNLOAD_DIR, source_rel))
+    if src_abs == dl_abs or not src_abs.startswith(dl_abs + os.sep):
+        return "Invalid source path (cannot be the downloads root or outside it)"
+    if src_abs.startswith(coll_abs + os.sep) or src_abs == coll_abs:
+        return "Source is already in a collection"
+    if src_abs.startswith(cat_abs + os.sep) or src_abs == cat_abs:
+        return "Cannot move a categorized folder to a collection"
+    if not os.path.isdir(src_abs):
+        return f"Source folder not found: {source_rel}"
+
+    # Normalize rel path for string construction (thumbnail paths, stale-cleanup prefix).
+    # os.path.abspath already resolved the path, derive clean rel from that.
+    source_rel = os.path.relpath(src_abs, DOWNLOAD_DIR)
+
+    dest_dir = os.path.join(_collections_dir(), collection_name)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    errors = []
+    for fname in sorted(os.listdir(src_abs)):
+        src_file = os.path.join(src_abs, fname)
+        if not os.path.isfile(src_file):
+            continue  # skip subdirs (flat move only)
+
+        # Collision-free dest filename
+        dest_fname = fname
+        counter = 2
+        while os.path.exists(os.path.join(dest_dir, dest_fname)):
+            stem, suffix = os.path.splitext(fname)
+            dest_fname = f"{stem}_{counter}{suffix}"
+            counter += 1
+
+        dest_file = os.path.join(dest_dir, dest_fname)
+        try:
+            shutil.move(src_file, dest_file)
+        except OSError as e:
+            errors.append(str(e))
+            continue
+
+        # Generate thumbnail for media files
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in _MEDIA_EXTS:
+            rel_dest = f"collections/{collection_name}/{dest_fname}"
+            try:
+                if ext in _IMAGE_EXTS:
+                    _generate_thumb(dest_file, rel_dest)
+                else:
+                    _generate_video_thumb(dest_file, rel_dest)
+            except Exception:
+                pass  # non-fatal
+
+        # Remove stale source thumbnail
+        rel_src = f"{source_rel}/{fname}"
+        old_thumb = _thumb_path(rel_src)
+        if os.path.exists(old_thumb):
+            try:
+                os.remove(old_thumb)
+            except OSError:
+                pass
+
+    if errors:
+        try:
+            remaining = len(
+                [f for f in os.listdir(src_abs) if os.path.isfile(os.path.join(src_abs, f))]
+            )
+        except OSError:
+            remaining = 0
+        return (
+            f"Errors during move: {'; '.join(errors)}. "
+            f"{remaining} file(s) remain in the source folder."
+        )
+
+    _remove_empty_dirs(src_abs)
+
+    # Targeted cleanup of stale ImageMeta rows for the moved folder.
+    # Uses Python-side startswith filter (SQL LIKE is unsafe — '_' is a wildcard).
+    # Only remove rows for files that no longer exist on disk — flat move skips
+    # subdirectories, so subdir media files remain in place and must keep their rows.
+    try:
+        prefix = source_rel.rstrip("/") + "/"
+        with get_session() as s:
+            stale = [
+                row
+                for row in s.scalars(select(ImageMeta)).all()
+                if row.file_path.startswith(prefix)
+                and not os.path.exists(os.path.join(DOWNLOAD_DIR, row.file_path))
+            ]
+            for row in stale:
+                s.execute(delete(FaceEmbedding).where(FaceEmbedding.file_path == row.file_path))
+                old_thumb = _thumb_path(row.file_path)
+                if os.path.exists(old_thumb):
+                    try:
+                        os.remove(old_thumb)
+                    except OSError:
+                        pass
+                s.delete(row)
+            s.commit()
+    except Exception:
+        pass  # stale rows cleaned on next full scan
+
+    regenerate_collection_gif(collection_name)
+
+    return None

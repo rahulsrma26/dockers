@@ -21,6 +21,7 @@ from scrap_downloader.db import (
     ImageMeta,
     MergeLog,
     Notification,
+    Tag,
 )
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -817,11 +818,26 @@ def test_rename_person_dismissed_match_no_duplicate():
 # ── dismiss_suggestion edge cases ─────────────────────────────────────────────
 
 
-def test_dismiss_suggestion_single_folder_no_pairs():
+def test_dismiss_suggestion_single_folder_self_pair():
+    """Single-folder suggestions (series) store a self-pair so dismiss actually works."""
     from sqlalchemy import select
     from sqlalchemy.orm import Session
 
     face_mod.dismiss_suggestion(["only_folder"])
+
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(DismissedMatch)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].folder_a == "only_folder"
+    assert rows[0].folder_b == "only_folder"
+
+
+def test_undismiss_suggestion_single_folder_removes_self_pair():
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    face_mod.dismiss_suggestion(["solo"])
+    face_mod.undismiss_suggestion(["solo"])
 
     with Session(db_mod.engine) as s:
         rows = s.execute(select(DismissedMatch)).scalars().all()
@@ -1497,3 +1513,800 @@ def test_undo_merge_preflight_old_path_occupied():
 
     result = face_mod.undo_merge(log.id)
     assert result is not None
+
+
+# ── Tag CRUD ──────────────────────────────────────────────────────────────────
+
+
+def test_add_tag_stores_lowercase():
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    face_mod.add_tag("person", "alice", "  Summer  ")
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].tag == "summer"
+    assert rows[0].entity_type == "person"
+    assert rows[0].entity_name == "alice"
+
+
+def test_add_tag_empty_is_noop():
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    face_mod.add_tag("person", "alice", "   ")
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    assert rows == []
+
+
+def test_add_tag_idempotent():
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    face_mod.add_tag("person", "alice", "summer")
+    face_mod.add_tag("person", "alice", "summer")
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    assert len(rows) == 1
+
+
+def test_add_tag_different_entity_types_isolated():
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    face_mod.add_tag("person", "alice", "travel")
+    face_mod.add_tag("collection", "vacation", "travel")
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    assert len(rows) == 2
+    types = {r.entity_type for r in rows}
+    assert types == {"person", "collection"}
+
+
+def test_remove_tag():
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    face_mod.add_tag("person", "alice", "summer")
+    face_mod.add_tag("person", "alice", "winter")
+    face_mod.remove_tag("person", "alice", "summer")
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].tag == "winter"
+
+
+def test_remove_tag_nonexistent_is_noop():
+    face_mod.remove_tag("person", "alice", "ghost")  # should not raise
+
+
+def test_get_tags_sorted():
+    face_mod.add_tag("person", "alice", "zebra")
+    face_mod.add_tag("person", "alice", "apple")
+    face_mod.add_tag("person", "alice", "mango")
+    result = face_mod.get_tags("person", "alice")
+    assert result == ["apple", "mango", "zebra"]
+
+
+def test_get_tags_empty():
+    assert face_mod.get_tags("person", "nobody") == []
+
+
+def test_get_all_tags_bulk():
+    face_mod.add_tag("person", "alice", "travel")
+    face_mod.add_tag("person", "alice", "summer")
+    face_mod.add_tag("person", "bob", "sport")
+    result = face_mod.get_all_tags("person")
+    assert sorted(result["alice"]) == ["summer", "travel"]
+    assert result["bob"] == ["sport"]
+
+
+def test_get_all_tags_empty():
+    assert face_mod.get_all_tags("person") == {}
+
+
+def test_list_all_tags_distinct_sorted():
+    face_mod.add_tag("person", "alice", "travel")
+    face_mod.add_tag("person", "bob", "travel")
+    face_mod.add_tag("person", "alice", "summer")
+    result = face_mod.list_all_tags("person")
+    assert result == ["summer", "travel"]
+
+
+def test_list_all_tags_entity_type_isolation():
+    face_mod.add_tag("person", "alice", "travel")
+    face_mod.add_tag("collection", "vac", "beach")
+    assert face_mod.list_all_tags("person") == ["travel"]
+    assert face_mod.list_all_tags("collection") == ["beach"]
+
+
+def test_rename_entity_tags_person():
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    face_mod.add_tag("person", "alice", "summer")
+    face_mod.add_tag("person", "alice", "travel")
+    face_mod.rename_entity_tags("person", "alice", "carol")
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    names = {r.entity_name for r in rows}
+    assert names == {"carol"}
+    assert len(rows) == 2
+
+
+def test_rename_entity_tags_noop_on_no_match():
+    face_mod.add_tag("person", "alice", "summer")
+    face_mod.rename_entity_tags("person", "nobody", "carol")
+    assert face_mod.get_tags("person", "alice") == ["summer"]
+
+
+def test_rename_person_propagates_tags():
+    """rename_person must migrate tags to the new name."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    cat = os.path.join(_dl(), "categorized")
+    os.makedirs(os.path.join(cat, "alice"), exist_ok=True)
+    face_mod.add_tag("person", "alice", "summer")
+
+    face_mod.rename_person("alice", "carol")
+
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].entity_name == "carol"
+
+
+def test_rename_collection_propagates_tags():
+    """rename_collection must migrate tags to the new name."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    coll_dir = os.path.join(_dl(), "collections", "old_coll")
+    os.makedirs(coll_dir, exist_ok=True)
+    face_mod.add_tag("collection", "old_coll", "faves")
+
+    face_mod.rename_collection("old_coll", "new_coll")
+
+    with Session(db_mod.engine) as s:
+        rows = s.execute(select(Tag)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].entity_name == "new_coll"
+
+
+# ── Composite thumbnails ──────────────────────────────────────────────────────
+
+
+def test_gif_key_different_from_thumb_key():
+    """GIF key must not collide with individual thumb SHA256 key."""
+    rel = "categorized/alice/photo.jpg"
+    assert face_mod._gif_key("categorized/alice") != face_mod._thumb_key(rel)
+
+
+def test_gif_key_stable():
+    k1 = face_mod._gif_key("categorized/alice")
+    k2 = face_mod._gif_key("categorized/alice")
+    assert k1 == k2
+
+
+def test_invalidate_gif_removes_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+    gp = face_mod._gif_path("categorized/alice")
+    open(gp, "wb").write(b"fake")
+    face_mod._invalidate_gif("categorized/alice")
+    assert not os.path.exists(gp)
+
+
+def test_invalidate_gif_noop_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    face_mod._invalidate_gif("categorized/alice")  # should not raise
+
+
+def test_get_gif_url_returns_fallback_when_no_gif():
+    url = face_mod.get_gif_url("categorized/alice", ["/thumbs/abc.jpg"])
+    assert url == "/thumbs/abc.jpg"
+
+
+def test_get_gif_url_returns_empty_when_no_fallback():
+    url = face_mod.get_gif_url("categorized/alice", [])
+    assert url == ""
+
+
+def test_get_gif_url_returns_gif_when_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+    gp = face_mod._gif_path("categorized/alice")
+    open(gp, "wb").write(b"fake_gif")
+    url = face_mod.get_gif_url("categorized/alice", ["/thumbs/fallback.jpg"])
+    assert url.startswith("/thumbs/")
+    assert url.endswith(".gif")
+    assert url != "/thumbs/fallback.jpg"
+
+
+def test_regenerate_person_gif_no_files_invalidates(tmp_path, monkeypatch):
+    """No ImageMeta rows → no GIF written, no crash."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+    face_mod.regenerate_person_gif("nobody")
+    gp = face_mod._gif_path("categorized/nobody")
+    assert not os.path.exists(gp)
+
+
+def test_regenerate_collection_gif_missing_dir(tmp_path, monkeypatch):
+    """Missing collection dir → GIF invalidated, no crash."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+    face_mod.regenerate_collection_gif("ghost_coll")
+    gp = face_mod._gif_path("collections/ghost_coll")
+    assert not os.path.exists(gp)
+
+
+def test_merge_into_gif_regenerated(monkeypatch):
+    """After merge_into, regenerate_person_gif is called."""
+    called = []
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: called.append(n))
+    _make_file("album/photo.jpg", b"data")
+    _insert_image_meta("album/photo.jpg", sha256="abc")
+    face_mod.merge_into(["album"], "alice")
+    assert called == ["alice"]
+
+
+def test_undo_merge_gif_invalidated_and_regenerated(monkeypatch):
+    """After undo_merge, invalidate then regenerate are called for dest."""
+    invalidated = []
+    regenerated = []
+    monkeypatch.setattr(face_mod, "_invalidate_gif", lambda r: invalidated.append(r))
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: regenerated.append(n))
+
+    _make_file("album/photo.jpg", b"data")
+    _insert_image_meta("album/photo.jpg", sha256="abc")
+    face_mod.merge_into(["album"], "alice")
+    regenerated.clear()
+    invalidated.clear()
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    with Session(db_mod.engine) as s:
+        log = s.execute(select(MergeLog)).scalars().first()
+
+    face_mod.undo_merge(log.id)
+    assert "categorized/alice" in invalidated
+    assert "alice" in regenerated
+
+
+def test_rename_person_invalidates_old_and_regenerates_new(monkeypatch):
+    invalidated = []
+    regenerated = []
+    monkeypatch.setattr(face_mod, "_invalidate_gif", lambda r: invalidated.append(r))
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: regenerated.append(n))
+
+    cat = os.path.join(_dl(), "categorized")
+    os.makedirs(os.path.join(cat, "alice"), exist_ok=True)
+    face_mod.rename_person("alice", "carol")
+    assert "categorized/alice" in invalidated
+    assert "carol" in regenerated
+
+
+def test_rename_person_renames_thumbnail_files(monkeypatch):
+    """rename_person must move existing thumbnail files to the new SHA256 key."""
+    monkeypatch.setattr(face_mod, "_invalidate_gif", lambda r: None)
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: None)
+
+    cat = os.path.join(_dl(), "categorized", "alice")
+    os.makedirs(cat, exist_ok=True)
+    open(os.path.join(cat, "photo.jpg"), "wb").write(b"img")
+
+    # Create a fake thumbnail at the old path
+    old_thumb = face_mod._thumb_path("categorized/alice/photo.jpg")
+    os.makedirs(os.path.dirname(old_thumb), exist_ok=True)
+    open(old_thumb, "wb").write(b"thumb")
+
+    face_mod.rename_person("alice", "carol")
+
+    new_thumb = face_mod._thumb_path("categorized/carol/photo.jpg")
+    assert os.path.isfile(new_thumb), "thumbnail must be moved to new key"
+    assert not os.path.isfile(old_thumb), "old thumbnail key must not exist"
+
+
+def test_rename_collection_invalidates_old_and_regenerates_new(monkeypatch):
+    invalidated = []
+    regenerated = []
+    monkeypatch.setattr(face_mod, "_invalidate_gif", lambda r: invalidated.append(r))
+    monkeypatch.setattr(face_mod, "regenerate_collection_gif", lambda n: regenerated.append(n))
+
+    coll_dir = os.path.join(_dl(), "collections", "old_coll")
+    os.makedirs(coll_dir, exist_ok=True)
+    face_mod.rename_collection("old_coll", "new_coll")
+    assert "collections/old_coll" in invalidated
+    assert "new_coll" in regenerated
+
+
+def test_delete_collection_file_triggers_gif_regen(monkeypatch):
+    """delete_collection_file must regenerate the collection GIF."""
+    regenerated = []
+    monkeypatch.setattr(face_mod, "regenerate_collection_gif", lambda n: regenerated.append(n))
+
+    coll_dir = os.path.join(_dl(), "collections", "mycoll")
+    os.makedirs(coll_dir, exist_ok=True)
+    fpath = os.path.join(coll_dir, "photo.jpg")
+    open(fpath, "wb").write(b"img")
+
+    face_mod.delete_collection_file("mycoll", "collections/mycoll/photo.jpg")
+    assert "mycoll" in regenerated
+
+
+def test_move_to_collection_triggers_gif_regen(monkeypatch):
+    """move_to_collection must regenerate the collection GIF after moving files."""
+    regenerated = []
+    monkeypatch.setattr(face_mod, "regenerate_collection_gif", lambda n: regenerated.append(n))
+
+    src_dir = os.path.join(_dl(), "album")
+    os.makedirs(src_dir, exist_ok=True)
+    open(os.path.join(src_dir, "photo.jpg"), "wb").write(b"img")
+
+    result = face_mod.move_to_collection("album", "mycoll")
+    assert result is None
+    assert "mycoll" in regenerated
+
+
+# ── Animated GIF generation ───────────────────────────────────────────────────
+
+
+def _make_rgb_jpeg(path: str, color: tuple = (128, 64, 32)) -> None:
+    """Write a minimal valid JPEG to path for use as a thumbnail input."""
+    from PIL import Image
+
+    img = Image.new("RGB", (40, 40), color)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img.save(path, "JPEG")
+
+
+def test_gif_path_ends_with_gif(tmp_path, monkeypatch):
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    assert face_mod._gif_path("categorized/alice").endswith(".gif")
+
+
+def test_gif_key_uses_animated_prefix():
+    """'animated:' prefix must be part of the key derivation (not 'composite:')."""
+    import hashlib
+
+    rel = "categorized/alice"
+    expected = hashlib.sha256(f"animated:{rel}".encode()).hexdigest()
+    assert face_mod._gif_key(rel) == expected
+    wrong = hashlib.sha256(f"composite:{rel}".encode()).hexdigest()
+    assert face_mod._gif_key(rel) != wrong
+
+
+def test_generate_animated_gif_creates_file(tmp_path, monkeypatch):
+    """_generate_animated_gif must write a .gif file when given valid JPEG inputs."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    thumb = str(tmp_path / "frame.jpg")
+    _make_rgb_jpeg(thumb)
+
+    face_mod._generate_animated_gif("categorized/alice", [thumb])
+
+    gp = face_mod._gif_path("categorized/alice")
+    assert os.path.isfile(gp), "GIF file must exist after generation"
+    assert gp.endswith(".gif")
+
+
+def test_generate_animated_gif_all_corrupt_invalidates(tmp_path, monkeypatch):
+    """If every frame path is unreadable, _generate_animated_gif must invalidate (no crash)."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    invalidated = []
+    monkeypatch.setattr(face_mod, "_invalidate_gif", lambda r: invalidated.append(r))
+
+    face_mod._generate_animated_gif("categorized/alice", ["/nonexistent/fake.jpg"])
+
+    assert "categorized/alice" in invalidated
+    assert not os.path.isfile(face_mod._gif_path("categorized/alice"))
+
+
+def test_generate_animated_gif_single_frame(tmp_path, monkeypatch):
+    """Single-frame animated GIF (only 1 thumbnail) must still be created."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    thumb = str(tmp_path / "solo.jpg")
+    _make_rgb_jpeg(thumb)
+    face_mod._generate_animated_gif("categorized/solo", [thumb])
+
+    assert os.path.isfile(face_mod._gif_path("categorized/solo"))
+
+
+def test_generate_animated_gif_caps_at_4_frames(tmp_path, monkeypatch):
+    """_generate_animated_gif must use at most 4 frames even when given more."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    thumbs = []
+    for i in range(6):
+        p = str(tmp_path / f"frame{i}.jpg")
+        _make_rgb_jpeg(p, color=(i * 40 % 256, 0, 0))
+        thumbs.append(p)
+
+    face_mod._generate_animated_gif("categorized/many", thumbs)
+
+    gp = face_mod._gif_path("categorized/many")
+    assert os.path.isfile(gp)
+    from PIL import Image
+
+    with Image.open(gp) as gif:
+        n_frames = getattr(gif, "n_frames", 1)
+    assert n_frames <= 4
+
+
+def test_regenerate_person_gif_creates_file_when_thumbs_exist(tmp_path, monkeypatch):
+    """regenerate_person_gif must produce a GIF when valid thumb files exist in DB."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    _make_file("categorized/alice/photo.jpg", b"img")
+    _insert_image_meta("categorized/alice/photo.jpg", sha256="aaa", max_face_ratio=0.5)
+
+    thumb = face_mod._thumb_path("categorized/alice/photo.jpg")
+    _make_rgb_jpeg(thumb)
+
+    called_gif = []
+    real_gen = face_mod._generate_animated_gif
+    monkeypatch.setattr(
+        face_mod, "_generate_animated_gif", lambda r, p: (called_gif.append(r), real_gen(r, p))
+    )
+
+    face_mod.regenerate_person_gif("alice")
+
+    assert "categorized/alice" in called_gif
+    assert os.path.isfile(face_mod._gif_path("categorized/alice"))
+
+
+def test_regenerate_person_gif_picks_highest_face_ratio(tmp_path, monkeypatch):
+    """regenerate_person_gif must order by max_face_ratio DESC (best faces first)."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    for fname, ratio in [("a.jpg", 0.1), ("b.jpg", 0.9), ("c.jpg", 0.5)]:
+        rel = f"categorized/alice/{fname}"
+        _make_file(rel, b"img")
+        _insert_image_meta(rel, sha256=fname, max_face_ratio=ratio)
+        _make_rgb_jpeg(face_mod._thumb_path(rel))
+
+    received_paths = []
+    monkeypatch.setattr(
+        face_mod, "_generate_animated_gif", lambda r, paths: received_paths.extend(paths)
+    )
+
+    face_mod.regenerate_person_gif("alice")
+
+    b_thumb = face_mod._thumb_path("categorized/alice/b.jpg")
+    assert received_paths[0] == b_thumb, "highest face-ratio thumb must be first"
+
+
+def test_regenerate_collection_gif_uses_sorted_filenames(tmp_path, monkeypatch):
+    """regenerate_collection_gif must iterate files in sorted order."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    coll_dir = os.path.join(_dl(), "collections", "pics")
+    os.makedirs(coll_dir, exist_ok=True)
+
+    for fname in ["c.jpg", "a.jpg", "b.jpg"]:
+        fpath = os.path.join(coll_dir, fname)
+        open(fpath, "wb").write(b"img")
+        _make_rgb_jpeg(face_mod._thumb_path(f"collections/pics/{fname}"))
+
+    received_paths = []
+    monkeypatch.setattr(
+        face_mod, "_generate_animated_gif", lambda r, paths: received_paths.extend(paths)
+    )
+
+    face_mod.regenerate_collection_gif("pics")
+
+    a_thumb = face_mod._thumb_path("collections/pics/a.jpg")
+    assert received_paths[0] == a_thumb, "sorted order: a.jpg must be first"
+
+
+def test_regenerate_collection_gif_skips_non_media(tmp_path, monkeypatch):
+    """regenerate_collection_gif must ignore non-media files (e.g. .txt)."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    coll_dir = os.path.join(_dl(), "collections", "mixed")
+    os.makedirs(coll_dir, exist_ok=True)
+
+    open(os.path.join(coll_dir, "readme.txt"), "wb").write(b"text")
+    _make_rgb_jpeg(face_mod._thumb_path("collections/mixed/photo.jpg"))
+    open(os.path.join(coll_dir, "photo.jpg"), "wb").write(b"img")
+
+    received = []
+    monkeypatch.setattr(face_mod, "_generate_animated_gif", lambda r, paths: received.extend(paths))
+
+    face_mod.regenerate_collection_gif("mixed")
+
+    assert len(received) == 1
+    # received[0] is the SHA256-keyed thumb path, not the original filename
+    assert received[0] == face_mod._thumb_path("collections/mixed/photo.jpg")
+
+
+def test_get_gif_url_key_prefix_differs_from_old_composite():
+    """get_gif_url must serve .gif not .jpg and key must differ from old composite key."""
+    import hashlib
+
+    rel = "categorized/alice"
+    old_composite_key = hashlib.sha256(f"composite:{rel}".encode()).hexdigest()
+    new_gif_key = face_mod._gif_key(rel)
+    assert new_gif_key != old_composite_key
+
+
+def test_regenerate_person_gif_missing_thumb_falls_back_to_invalidate(tmp_path, monkeypatch):
+    """DB row exists but thumb file is missing → no GIF generated, invalidate called."""
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    _make_file("categorized/bob/photo.jpg", b"img")
+    _insert_image_meta("categorized/bob/photo.jpg", sha256="bbb", max_face_ratio=0.3)
+    # deliberately do NOT create a thumb file
+
+    invalidated = []
+    monkeypatch.setattr(face_mod, "_invalidate_gif", lambda r: invalidated.append(r))
+
+    face_mod.regenerate_person_gif("bob")
+
+    assert "categorized/bob" in invalidated
+    assert not os.path.isfile(face_mod._gif_path("categorized/bob"))
+
+
+# ── warmup_missing_gifs ───────────────────────────────────────────────────────
+
+
+def test_warmup_missing_categorized_dir_no_crash(tmp_path, monkeypatch):
+    """warmup_missing_gifs must not crash when categorized dir doesn't exist."""
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(tmp_path / "categorized"))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    face_mod.warmup_missing_gifs()  # must not raise
+
+
+def test_warmup_generates_missing_person_gif(tmp_path, monkeypatch):
+    """warmup_missing_gifs calls regenerate_person_gif for persons without a GIF."""
+    cat_dir = tmp_path / "categorized"
+    (cat_dir / "alice").mkdir(parents=True)
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    monkeypatch.setattr(
+        face_mod,
+        "_gif_path",
+        lambda rel: str(tmp_path / "thumbs" / (rel.replace("/", "_") + ".gif")),
+    )
+
+    generated = []
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: generated.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert generated == ["alice"]
+
+
+def test_warmup_skips_existing_person_gif(tmp_path, monkeypatch):
+    """warmup_missing_gifs skips persons that already have a GIF file."""
+    cat_dir = tmp_path / "categorized"
+    (cat_dir / "alice").mkdir(parents=True)
+
+    # Simulate existing GIF by making _gif_path point to a real file
+    gif_dir = tmp_path / "thumbs"
+    gif_dir.mkdir()
+
+    def fake_gif_path(rel):
+        return str(gif_dir / (rel.replace("/", "_") + ".gif"))
+
+    (gif_dir / "categorized_alice.gif").write_bytes(b"GIF89a")
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    monkeypatch.setattr(face_mod, "_gif_path", fake_gif_path)
+
+    generated = []
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: generated.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert generated == []
+
+
+def test_warmup_skips_dotfiles(tmp_path, monkeypatch):
+    """warmup_missing_gifs skips entries whose name starts with '.'."""
+    cat_dir = tmp_path / "categorized"
+    (cat_dir / ".DS_Store").mkdir(parents=True)
+    (cat_dir / "alice").mkdir()
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    monkeypatch.setattr(
+        face_mod,
+        "_gif_path",
+        lambda rel: str(tmp_path / "thumbs" / (rel.replace("/", "_") + ".gif")),
+    )
+
+    generated = []
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: generated.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert generated == ["alice"]
+    assert ".DS_Store" not in generated
+
+
+def test_warmup_skips_non_dir_entries(tmp_path, monkeypatch):
+    """warmup_missing_gifs skips plain files inside categorized dir."""
+    cat_dir = tmp_path / "categorized"
+    cat_dir.mkdir()
+    (cat_dir / "stray_file.txt").write_text("oops")
+    (cat_dir / "alice").mkdir()
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    monkeypatch.setattr(
+        face_mod,
+        "_gif_path",
+        lambda rel: str(tmp_path / "thumbs" / (rel.replace("/", "_") + ".gif")),
+    )
+
+    generated = []
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: generated.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert generated == ["alice"]
+    assert "stray_file.txt" not in generated
+
+
+def test_warmup_generates_missing_collection_gif(tmp_path, monkeypatch):
+    """warmup_missing_gifs calls regenerate_collection_gif for collections without a GIF."""
+    coll_dir = tmp_path / "collections"
+    (coll_dir / "summer").mkdir(parents=True)
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(tmp_path / "categorized"))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(coll_dir))
+    monkeypatch.setattr(
+        face_mod,
+        "_gif_path",
+        lambda rel: str(tmp_path / "thumbs" / (rel.replace("/", "_") + ".gif")),
+    )
+
+    generated = []
+    monkeypatch.setattr(face_mod, "regenerate_collection_gif", lambda n: generated.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert generated == ["summer"]
+
+
+def test_warmup_skips_existing_collection_gif(tmp_path, monkeypatch):
+    """warmup_missing_gifs skips collections that already have a GIF file."""
+    coll_dir = tmp_path / "collections"
+    (coll_dir / "summer").mkdir(parents=True)
+
+    gif_dir = tmp_path / "thumbs"
+    gif_dir.mkdir()
+
+    def fake_gif_path(rel):
+        return str(gif_dir / (rel.replace("/", "_") + ".gif"))
+
+    (gif_dir / "collections_summer.gif").write_bytes(b"GIF89a")
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(tmp_path / "categorized"))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(coll_dir))
+    monkeypatch.setattr(face_mod, "_gif_path", fake_gif_path)
+
+    generated = []
+    monkeypatch.setattr(face_mod, "regenerate_collection_gif", lambda n: generated.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert generated == []
+
+
+def test_warmup_exception_in_one_person_does_not_abort_rest(tmp_path, monkeypatch):
+    """If regenerate_person_gif raises for one entry, others are still processed."""
+    cat_dir = tmp_path / "categorized"
+    (cat_dir / "alice").mkdir(parents=True)
+    (cat_dir / "bob").mkdir()
+    (cat_dir / "carol").mkdir()
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    monkeypatch.setattr(
+        face_mod,
+        "_gif_path",
+        lambda rel: str(tmp_path / "thumbs" / (rel.replace("/", "_") + ".gif")),
+    )
+
+    generated = []
+
+    def boom_on_bob(name):
+        if name == "bob":
+            raise RuntimeError("simulated failure")
+        generated.append(name)
+
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", boom_on_bob)
+
+    face_mod.warmup_missing_gifs()
+
+    assert set(generated) == {"alice", "carol"}
+
+
+def test_warmup_mixed_persons_only_missing_generated(tmp_path, monkeypatch):
+    """Only persons without an existing GIF file are regenerated."""
+    cat_dir = tmp_path / "categorized"
+    (cat_dir / "alice").mkdir(parents=True)
+    (cat_dir / "bob").mkdir()
+
+    gif_dir = tmp_path / "thumbs"
+    gif_dir.mkdir()
+
+    def fake_gif_path(rel):
+        return str(gif_dir / (rel.replace("/", "_") + ".gif"))
+
+    # alice already has a GIF; bob does not
+    (gif_dir / "categorized_alice.gif").write_bytes(b"GIF89a")
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    monkeypatch.setattr(face_mod, "_gif_path", fake_gif_path)
+
+    generated = []
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: generated.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert generated == ["bob"]
+
+
+def test_warmup_missing_collections_dir_no_crash(tmp_path, monkeypatch):
+    """warmup_missing_gifs must not crash when collections dir doesn't exist."""
+    cat_dir = tmp_path / "categorized"
+    cat_dir.mkdir()
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+    monkeypatch.setattr(
+        face_mod,
+        "_gif_path",
+        lambda rel: str(tmp_path / "thumbs" / (rel.replace("/", "_") + ".gif")),
+    )
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: None)
+
+    face_mod.warmup_missing_gifs()  # must not raise
+
+
+def test_warmup_processes_both_persons_and_collections(tmp_path, monkeypatch):
+    """warmup_missing_gifs generates GIFs for both persons and collections in one call."""
+    cat_dir = tmp_path / "categorized"
+    (cat_dir / "alice").mkdir(parents=True)
+    coll_dir = tmp_path / "collections"
+    (coll_dir / "summer").mkdir(parents=True)
+
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(cat_dir))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(coll_dir))
+    monkeypatch.setattr(
+        face_mod,
+        "_gif_path",
+        lambda rel: str(tmp_path / "thumbs" / (rel.replace("/", "_") + ".gif")),
+    )
+
+    persons = []
+    colls = []
+    monkeypatch.setattr(face_mod, "regenerate_person_gif", lambda n: persons.append(n))
+    monkeypatch.setattr(face_mod, "regenerate_collection_gif", lambda n: colls.append(n))
+
+    face_mod.warmup_missing_gifs()
+
+    assert persons == ["alice"]
+    assert colls == ["summer"]

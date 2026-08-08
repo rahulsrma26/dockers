@@ -158,6 +158,19 @@ class MergeLog(Base):
     file_map: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
+class Tag(Base):
+    """User-defined tags per person or collection — used for filter bar."""
+
+    __tablename__ = "tag"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entity_type: Mapped[str] = mapped_column(String, nullable=False)  # "person" | "collection"
+    entity_name: Mapped[str] = mapped_column(String, nullable=False)
+    tag: Mapped[str] = mapped_column(String, nullable=False)
+
+    __table_args__ = (UniqueConstraint("entity_type", "entity_name", "tag"),)
+
+
 # ── Settings helpers ──────────────────────────────────────────────────────────
 
 _SETTING_DEFAULTS: dict[str, str] = {

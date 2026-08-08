@@ -216,7 +216,12 @@ ROLES = [
 ]
 
 
-def run_base(test_dir: Path, imgs: dict[str, list[Path]], chosen: list[str]) -> None:
+def run_base(
+    test_dir: Path,
+    imgs: dict[str, list[Path]],
+    chosen: list[str],
+    collection_people: list[str] | None = None,
+) -> None:
     (
         person_a,
         person_b,
@@ -298,6 +303,20 @@ def run_base(test_dir: Path, imgs: dict[str, list[Path]], chosen: list[str]) -> 
     copy_series(imgs[person_b][:4], hid_dir, 4)
     make_noface_image(hid_dir / ".hidden_a.jpg", (80, 80, 80))
     make_noface_image(hid_dir / ".hidden_b.jpg", (120, 120, 120))
+
+    # Cases 14+: Misc dirs for testing "Add to collection".
+    # These are random non-famous people with 1-2 images each — below the
+    # face-cluster threshold (default min_images=3), so they won't appear as
+    # merge/new-person suggestions.  Use the "Add to collection" button on any
+    # suggestion card, or navigate to Suggestions to find these as uncategorized.
+    if collection_people:
+        print(
+            f"\nCases 14-{13 + len(collection_people)}  misc dirs for 'Add to collection' testing"
+        )
+        for i, person in enumerate(collection_people, 1):
+            dest = test_dir / f"misc_person{i}"
+            copy_series(imgs.get(person, [])[:4], dest, 4, prefix="photo")
+            print(f"  misc_person{i}/  ← {person} (3-4 imgs)")
 
 
 def run_add(test_dir: Path, imgs: dict[str, list[Path]], chosen: list[str]) -> None:
@@ -424,6 +443,17 @@ def main() -> None:
     for role, name in zip(ROLES, chosen):
         print(f"  {role:35s}  {name} ({counts[name]} imgs)")
 
+    # Pick non-famous people for "Add to collection" test dirs.
+    # Any person with >=1 image who isn't famous and wasn't already chosen.
+    non_famous_pool = sorted(
+        p for p, c in counts.items() if c >= 1 and p not in set(FAMOUS) and p not in set(chosen)
+    )
+    random.seed(args.seed + 99)
+    coll_people = random.sample(non_famous_pool, min(3, len(non_famous_pool)))
+    print("\nCollection test dirs:")
+    for i, name in enumerate(coll_people, 1):
+        print(f"  misc_person{i}  ← {name} ({counts[name]} imgs in archive, copying up to 4)")
+
     test_dir = dl / "test"
 
     if args.add:
@@ -462,10 +492,10 @@ def main() -> None:
         with tempfile.TemporaryDirectory() as _tmp:
             tmp = Path(_tmp)
             imgs = {}
-            for person in chosen:
+            for person in chosen + coll_people:
                 print(f"  extracting {person}…")
                 imgs[person] = extract_person(tgz, root, person, tmp / person)
-            run_base(test_dir, imgs, chosen)
+            run_base(test_dir, imgs, chosen, collection_people=coll_people)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     total = sum(1 for f in test_dir.rglob("*") if f.is_file())
@@ -491,6 +521,10 @@ def main() -> None:
         print("  deep/nested/subdir/        → recursive scan reaches nested dir")
         print("  mixed_files/               → .txt/.json/.mp4 skipped, 3 jpgs scanned")
         print("  has_hidden/                → .hidden_*.jpg excluded, 4 jpgs scanned")
+        for i in range(1, len(coll_people) + 1):
+            print(
+                f"  misc_person{i}/             → 3-4 imgs — use 'Add to collection' button to test"
+            )
 
 
 if __name__ == "__main__":

@@ -57,17 +57,34 @@ def _run_ytdlp(task: Task):
     download_video(task.url, save_dir, audio_only=audio_only)
 
 
+def _parse_media_type(extra_args: str | None) -> str:
+    """Extract --media-type value from extra_args string. Returns '' if not set."""
+    if not extra_args:
+        return ""
+    parts = extra_args.split()
+    try:
+        return parts[parts.index("--media-type") + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
 def _run_auto(task: Task):
     domain = urlparse(task.url).hostname or ""
     plugin = _load_plugin(domain)
     save_dir = os.path.join(DOWNLOAD_DIR, task.tag)
+    media_type = _parse_media_type(task.extra_args)
 
     if plugin is None:
         logger.info(f"No plugin for {domain}, falling back to yt-dlp")
-        download_video(task.url, save_dir)
+        if media_type != "images":
+            download_video(task.url, save_dir)
         return
 
     items = [to_download_item(i) for i in plugin.extract(task.url)]
+    if media_type == "images":
+        items = [it for it in items if it.type == "image"]
+    elif media_type == "videos":
+        items = [it for it in items if it.type == "video"]
     total = len(items)
     errors = []
 
