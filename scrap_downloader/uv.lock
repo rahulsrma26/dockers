@@ -410,14 +410,14 @@ wheels = [
 
 [[package]]
 name = "gallery-dl"
-version = "1.32.3"
+version = "1.32.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4b/0c/bd908d5de020ddddb4bb99757adbda4213028ed3af263eedb21226615906/gallery_dl-1.32.3.tar.gz", hash = "sha256:038059880b9b5bedea0f0226e04dc91f92e759c992ccf2a706d6912776db103b", size = 718570, upload-time = "2026-06-13T09:26:54.613Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b1/60/5131cd00162b86dbf3f4528d348eba2f97bc22e2b452855b23c51d5fe340/gallery_dl-1.32.9.tar.gz", hash = "sha256:6847cf1b8fcb231b3a214965470ac64bfbe4f63e92f1d7dbda2d533c3930f07d", size = 735350, upload-time = "2026-08-01T09:47:04.677Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ac/79/ea941a888cfbc2035f7684f116d5f545c121720f7465cf59cc79bd991d6d/gallery_dl-1.32.3-py3-none-any.whl", hash = "sha256:8759d84737cc2e72d21de5a03bb34d359565ee817026f38769d2e8400cf62c80", size = 888760, upload-time = "2026-06-13T09:26:50.68Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/0b/766ddfd2035b6fb354b57fe4cdf620cd84f9eba3efe5701049a93602a7e4/gallery_dl-1.32.9-py3-none-any.whl", hash = "sha256:271d18fed61e0b9f006d4944be59341b9af136576382e237aa08ba6d060a0e9a", size = 914866, upload-time = "2026-08-01T09:47:00.771Z" },
 ]
 
 [[package]]
@@ -1647,7 +1647,7 @@ wheels = [
 
 [[package]]
 name = "scrap-downloader"
-version = "0.7.2"
+version = "0.8.13"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -1678,7 +1678,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
     { name = "cloudscraper", specifier = ">=1.2.71" },
     { name = "faiss-cpu", specifier = ">=1.8.0" },
-    { name = "gallery-dl", specifier = ">=1.32.3" },
+    { name = "gallery-dl", specifier = ">=1.32.9" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "imagehash", specifier = ">=4.3.2" },
     { name = "insightface", specifier = ">=0.7.3" },

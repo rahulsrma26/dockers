@@ -112,6 +112,12 @@ def _run_auto(task: Task):
         raise RuntimeError(errors[0])
 
 
+def _count_files(directory: str) -> int:
+    if not os.path.isdir(directory):
+        return 0
+    return sum(len(files) for _, _, files in os.walk(directory))
+
+
 def _process(task: Task):
     with get_session() as session:
         t = session.get(Task, task.id)
@@ -120,6 +126,9 @@ def _process(task: Task):
         t.status = TaskStatus.in_progress
         t.progress = 0.0
         session.commit()
+
+    save_dir = os.path.join(DOWNLOAD_DIR, task.tag)
+    files_before = _count_files(save_dir)
 
     try:
         if task.tool == TaskTool.gallery_dl:
@@ -132,12 +141,15 @@ def _process(task: Task):
         _fail(task.id, str(e))
         return
 
+    files_after = _count_files(save_dir)
+
     with get_session() as session:
         t = session.get(Task, task.id)
         if t is None:
             return
         t.status = TaskStatus.done
         t.progress = 100.0
+        t.files_downloaded = max(0, files_after - files_before)
         t.completed_at = utcnow()
         session.commit()
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html as _html
 import json
+import math
 import os
 from typing import Any, Callable
 from urllib.parse import quote
@@ -44,6 +45,35 @@ _LG_INIT_JS = (
 )
 
 _gif_warmup_task: asyncio.Task | None = None
+
+# Injected into organize_page <head> to fix hardcoded light-bg banners in dark mode.
+# Quasar adds body--dark to <body>; Tailwind dark: prefix doesn't respond to it.
+# Specificity 0-2-1 beats Tailwind's single-class 0-1-0, so no !important needed.
+_DARK_BANNER_CSS = (
+    "<style>"
+    "body.body--dark .banner-info"
+    "{background:rgba(120,80,0,.25);border-color:#92610a;color:#e5c88a}"
+    "body.body--dark .banner-warn"
+    "{background:rgba(100,50,0,.25);border-color:#9a3412;color:#fed7aa}"
+    "body.body--dark .banner-error"
+    "{background:rgba(80,0,0,.25);border-color:#991b1b;color:#fca5a5}"
+    "body.body--dark .banner-merge"
+    "{background:rgba(0,40,100,.25);border-color:#1d4ed8;color:#93c5fd}"
+    "body.body--dark .banner-info .banner-text{color:#fcd34d}"
+    "body.body--dark .banner-warn .banner-text{color:#fb923c}"
+    "body.body--dark .banner-error .banner-text{color:#fca5a5}"
+    "</style>"
+)
+
+# All SVG attribute quotes are %22 (encoded ") so the data URI contains no literal
+# single quotes — required because the onerror JS embeds it as src='...'.
+_VIDEO_THUMB_FALLBACK = (
+    "data:image/svg+xml,"
+    "%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22256%22 height=%22256%22%3E"
+    "%3Crect fill=%22%231a1a1a%22 width=%22256%22 height=%22256%22/%3E"
+    "%3Cpolygon fill=%22%23666%22 points=%2296%2C76%20176%2C128%2096%2C180%22/%3E"
+    "%3C/svg%3E"
+)
 
 
 @app.on_startup
@@ -128,18 +158,37 @@ def _categorized_dir() -> str:
 
 
 def _person_file_count(person_name: str) -> int:
+    from sqlalchemy import func
+
     folder_rel = f"categorized/{person_name}"
     with get_session() as s:
-        rows = (
+        return (
             s.execute(
-                select(ImageMeta).where(
-                    ImageMeta.file_path.like(_like_prefix(folder_rel), escape="\\")
-                )
-            )
-            .scalars()
-            .all()
+                select(func.count())
+                .select_from(ImageMeta)
+                .where(ImageMeta.file_path.like(_like_prefix(folder_rel), escape="\\"))
+            ).scalar()
+            or 0
         )
-        return len(rows)
+
+
+def _batch_person_file_counts(people: list[str]) -> dict[str, int]:
+    """Return {person: count} for all people in one DB query."""
+    if not people:
+        return {}
+    people_set = set(people)
+    with get_session() as s:
+        rows = s.execute(
+            select(ImageMeta.file_path).where(
+                ImageMeta.file_path.like(_like_prefix("categorized"), escape="\\")
+            )
+        ).all()
+    counts: dict[str, int] = {p: 0 for p in people}
+    for (path,) in rows:
+        parts = path.split("/", 2)
+        if len(parts) >= 3 and parts[1] in people_set:
+            counts[parts[1]] += 1
+    return counts
 
 
 def _person_thumbs(person_name: str, n: int = 4) -> list[str]:
@@ -151,25 +200,13 @@ def _person_thumbs(person_name: str, n: int = 4) -> list[str]:
         rows = (
             s.execute(
                 select(ImageMeta)
-                .where(
-                    ImageMeta.file_path.like(pattern, escape="\\"),
-                    ImageMeta.max_face_ratio.isnot(None),
-                )
-                .order_by(ImageMeta.max_face_ratio.desc())
+                .where(ImageMeta.file_path.like(pattern, escape="\\"))
+                .order_by(ImageMeta.max_face_ratio.desc().nulls_last())
                 .limit(n)
             )
             .scalars()
             .all()
         )
-        if not rows:
-            rows = (
-                s.execute(
-                    select(ImageMeta).where(ImageMeta.file_path.like(pattern, escape="\\")).limit(n)
-                )
-                .scalars()
-                .all()
-            )
-
     return [f"/thumbs/{hashlib.sha256(r.file_path.encode()).hexdigest()}.jpg" for r in rows]
 
 
@@ -265,13 +302,14 @@ def _validate_name(name: str) -> str | None:
 
 
 @ui.page("/organize")
-def organize_page(tab: str = "scan"):
+def organize_page(tab: str = "scan", page: int = 1, untagged: bool = False):
     if not check_auth():
         ui.navigate.to("/login")
         return
 
     ui.page_title("Organize — Scrap Downloader")
     ui.add_body_html(_auto_logout_js())
+    ui.add_head_html(_DARK_BANNER_CSS)
 
     dark = ui.dark_mode()
     dark.set_value(app.storage.user.get("dark_mode", False))
@@ -288,6 +326,9 @@ def organize_page(tab: str = "scan"):
         "suggestions": _sugg_init,
         "ambiguous": _amb_init,
         "active_tab": tab,
+        "cat_page": max(0, page - 1) if tab == "categorized" else 0,
+        "coll_page": max(0, page - 1) if tab == "collections" else 0,
+        "cat_untagged": untagged if tab == "categorized" else False,
     }
 
     def _toggle_dark(dark=dark):
@@ -313,7 +354,7 @@ def organize_page(tab: str = "scan"):
         # Notification banner
         notifs = _poll_notifications()
         for notif in notifs:
-            with ui.card().classes("w-full bg-blue-50 border border-blue-200"):
+            with ui.card().classes("w-full bg-blue-50 border border-blue-200 banner-merge"):
                 with ui.row().classes("items-center gap-2"):
                     ui.icon("notifications").classes("text-blue-500")
                     ui.label(
@@ -415,7 +456,7 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
 
     # First-time guide
     if not last_scan and scan_status != "running":
-        with ui.card().classes("w-full bg-amber-50 border border-amber-200 mb-2"):
+        with ui.card().classes("w-full bg-amber-50 border border-amber-200 mb-2 banner-info"):
             ui.label("Getting started").classes("font-semibold mb-1")
             with ui.column().classes("gap-1 text-sm"):
                 ui.label("1. Configure face model and thresholds in Settings")
@@ -424,22 +465,15 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
 
     # Model mismatch warning
     if scan_model and scan_model != face_model:
-        with ui.card().classes("w-full bg-orange-50 border border-orange-300"):
+        with ui.card().classes("w-full bg-orange-50 border border-orange-300 banner-warn"):
             ui.label(f"Model changed ({scan_model} → {face_model}) — re-scan required").classes(
-                "text-orange-700 text-sm"
+                "text-orange-700 text-sm banner-text"
             )
 
     # Error banner
     if last_error and scan_status != "running":
-        with ui.card().classes("w-full bg-red-50 border border-red-300"):
-            ui.label(f"Last scan failed: {last_error}").classes("text-red-700 text-sm")
-
-    # Scan recommended banner
-    if last_scan is None and scan_model:
-        with ui.card().classes("w-full bg-yellow-50 border border-yellow-200"):
-            ui.label("Scan recommended — files may have changed since last merge").classes(
-                "text-yellow-700 text-sm"
-            )
+        with ui.card().classes("w-full bg-red-50 border border-red-300 banner-error"):
+            ui.label(f"Last scan failed: {last_error}").classes("text-red-700 text-sm banner-text")
 
     # Status line
     status_label = ui.label("").classes("text-sm text-gray-500")
@@ -495,8 +529,9 @@ def _build_scan_tab(state: dict, tabs, tab_suggest):
 
         if s == "running":
             status_label.set_text(f"Scanning with {model}…")
-            progress_bar.set_value(p / t if t else 0)
-            counter_label.set_text(f"{p} / {t} files")
+            progress_bar.set_value(min(p / t, 1.0) if t else 0)
+            pct = min(p * 100 // t, 100) if t else 0
+            counter_label.set_text(f"{p} / {t} files — {pct}%")
             scan_btn.set_enabled(False)
             cancel_btn.set_visibility(True)
             _refresh_stats()
@@ -1123,12 +1158,55 @@ def _show_undo_confirm(merge: dict, state: dict, container):
     dlg.open()
 
 
+def _build_pager(container, cur_page: int, total_pages: int, go: Callable[[int], None]) -> None:
+    """Render a windowed page navigator. go(n) is called when page n is clicked."""
+    container.clear()
+    if total_pages <= 1:
+        container.set_visibility(False)
+        return
+    container.set_visibility(True)
+
+    win_start = max(0, cur_page - 5)
+    win_end = min(total_pages - 1, cur_page + 5)
+    last = total_pages - 1
+
+    items: list[int | None] = []
+    if win_start > 0:
+        items.append(0)
+        if win_start > 1:
+            items.append(None)
+    items.extend(range(win_start, win_end + 1))
+    if win_end < last:
+        if win_end < last - 1:
+            items.append(None)
+        items.append(last)
+
+    with container:
+        is_first = cur_page == 0
+        is_last = cur_page == last
+        ui.button("«", on_click=lambda p=0: go(p)).props("flat dense").set_enabled(not is_first)
+        ui.button("‹", on_click=lambda p=max(0, cur_page - 1): go(p)).props(
+            "flat dense"
+        ).set_enabled(not is_first)
+        for item in items:
+            if item is None:
+                ui.label("…").classes("self-center px-1 text-gray-400")
+            else:
+                btn = ui.button(str(item + 1), on_click=lambda p=item: go(p)).props("flat dense")
+                if item == cur_page:
+                    btn.props(add="color=primary")
+        ui.button("›", on_click=lambda p=min(last, cur_page + 1): go(p)).props(
+            "flat dense"
+        ).set_enabled(not is_last)
+        ui.button("»", on_click=lambda p=last: go(p)).props("flat dense").set_enabled(not is_last)
+
+
 def _render_categorized(container, state: dict | None = None):
     from . import face as face_mod
 
-    people = _list_people()
+    all_people = _list_people()
 
-    if not people:
+    if not all_people:
         with ui.column().classes("items-center gap-2 py-8"):
             ui.icon("folder_off").classes("text-4xl text-gray-300")
             ui.label("No categorized people yet.").classes("text-gray-500")
@@ -1158,8 +1236,26 @@ def _render_categorized(container, state: dict | None = None):
         merge_btn.set_visibility(True)
         ui.run_javascript("delete document.getElementById('cat-grid').dataset.merge")
 
+    untagged_only = {"value": state.get("cat_untagged", False) if state is not None else False}
+    _untagged_btn_ref: list = [None]
+
+    def _toggle_untagged():
+        untagged_only["value"] = not untagged_only["value"]
+        if state is not None:
+            state["cat_untagged"] = untagged_only["value"]
+            state["cat_page"] = 0
+        if untagged_only["value"]:
+            tag_filter.set_value([])
+            if state is not None:
+                state["cat_tag_filter"] = []
+            _untagged_btn_ref[0].props(add="color=primary")
+        else:
+            _untagged_btn_ref[0].props(remove="color=primary")
+        _update_view(page=0)
+        _sync_cat_url()
+
     with ui.row().classes("items-center justify-between w-full mb-2 gap-2"):
-        ui.label(f"{len(people)} people").classes("text-sm text-gray-500 shrink-0")
+        count_lbl = ui.label(f"{len(all_people)} people").classes("text-sm text-gray-500 shrink-0")
         filter_input = ui.input(placeholder="Filter...").classes("flex-1")
         tag_filter = ui.select(
             face_mod.list_all_tags("person"),
@@ -1167,6 +1263,13 @@ def _render_categorized(container, state: dict | None = None):
             label="Tags",
             clearable=True,
         ).classes("w-40")
+        _untagged_btn_ref[0] = (
+            ui.button("Untagged", icon="label_off", on_click=_toggle_untagged)
+            .props("flat dense")
+            .tooltip("Show people with no tags")
+        )
+        if untagged_only["value"]:
+            _untagged_btn_ref[0].props(add="color=primary")
         with ui.row().classes("gap-2 shrink-0"):
             if last_merge:
                 ui.button(
@@ -1178,100 +1281,193 @@ def _render_categorized(container, state: dict | None = None):
                 "flat"
             )
 
-    with ui.row().classes("items-center gap-2 w-full bg-blue-50 p-2 rounded") as merge_bar:
-        merge_status_label = ui.label("Select two people to merge").classes("text-sm flex-1")
+    with ui.row().classes(
+        "items-center gap-2 w-full bg-blue-50 p-2 rounded banner-merge"
+    ) as merge_bar:
+        merge_status_label = ui.label("Select two people to merge").classes(
+            "text-sm flex-1 banner-text"
+        )
         ui.button("Cancel", on_click=cancel_merge_mode).props("flat dense")
 
     merge_bar.set_visibility(False)
 
-    person_cards: dict[str, Any] = {}
+    PAGE_SIZE = 24
+    top_pager = ui.row().classes("items-center justify-center flex-wrap gap-1 my-1")
+    grid_container = ui.column().classes("w-full")
+    bottom_pager = ui.row().classes("items-center justify-center flex-wrap gap-1 my-1")
 
-    with ui.grid(columns=3).classes("w-full gap-4").props("id=cat-grid"):
-        for person in people:
-            thumbs = _person_thumbs(person, n=4)
-            count = _person_file_count(person)
-            entity_rel = f"categorized/{person}"
+    def _compute_visible() -> list[str]:
+        if untagged_only["value"]:
+            return [p for p in all_people if not person_tags.get(p)]
+        query = filter_input.value.strip().casefold()
+        selected_tags = tag_filter.value or []
+        return [
+            p
+            for p in all_people
+            if (not query or query in p.casefold())
+            and (not selected_tags or all(t in person_tags.get(p, []) for t in selected_tags))
+        ]
 
-            with ui.card().classes(
-                "w-full cursor-pointer hover:shadow-md transition-shadow relative"
-            ) as card:
-                person_cards[person] = card
+    def _update_view(page: int | None = None):
+        visible = _compute_visible()
+        if state is not None:
+            state["visible_people"] = visible
 
-                # Animated GIF thumbnail with fallback to first individual thumb
-                thumb_url = face_mod.get_gif_url(entity_rel, thumbs)
-                if thumb_url:
-                    ui.image(thumb_url).classes("w-full aspect-square object-cover rounded").props(
-                        "loading=lazy"
-                    )
-                else:
-                    ui.element("div").classes("w-full aspect-square bg-gray-100 rounded")
+        total_pages = max(1, math.ceil(len(visible) / PAGE_SIZE))
+        if page is None:
+            page = state.get("cat_page", 0) if state is not None else 0
+        page = max(0, min(page, total_pages - 1))
+        if state is not None:
+            state["cat_page"] = page
 
-                # Clickable overlay — covers the whole card; prevented in merge mode
-                ui.html(
-                    f'<a href="/gallery/{quote(person)}" '
-                    f'class="absolute inset-0 z-0" '
-                    f"onclick=\"if(this.closest('[data-merge]')){{event.preventDefault();}}\""
-                    f"></a>"
-                )
+        n_vis = len(visible)
+        n_all = len(all_people)
+        count_lbl.set_text(f"{n_vis} / {n_all} people" if n_vis != n_all else f"{n_all} people")
 
-                ui.label(person).classes("font-semibold mt-2 truncate")
-                ui.label(f"{count} file{'s' if count != 1 else ''}").classes(
-                    "text-xs text-gray-400"
-                )
+        def _go(p: int):
+            _update_view(page=p)
+            _sync_cat_url()
 
-                # Read-only tag chips — clicking propagates to card for merge-mode selection
-                with ui.row().classes("gap-1 flex-wrap items-center mt-1 relative z-10"):
-                    for t in person_tags.get(person, []):
-                        ui.chip(t).props("dense outline").classes("text-xs")
+        _build_pager(top_pager, page, total_pages, _go)
 
-                def make_select_handler(p):
-                    def on_click():
-                        if not merge_state["mode"]:
-                            return  # <a> overlay handles navigation
-                        if p in merge_state["selected"]:
-                            merge_state["selected"].remove(p)
-                        elif len(merge_state["selected"]) < 2:
-                            merge_state["selected"].append(p)
+        sliced = visible[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+        file_counts = _batch_person_file_counts(sliced)
+        grid_container.clear()
+        with grid_container:
+            with (
+                ui.element("div")
+                .classes("grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 w-full gap-4")
+                .props("id=cat-grid")
+            ):
+                for person in sliced:
+                    count = file_counts.get(person, 0)
+                    entity_rel = f"categorized/{person}"
 
-                        sel = merge_state["selected"]
-                        if len(sel) == 0:
-                            merge_status_label.set_text("Select two people to merge")
-                        elif len(sel) == 1:
-                            merge_status_label.set_text(f"Selected: {sel[0]} — select one more")
+                    with ui.card().classes(
+                        "w-full cursor-pointer hover:shadow-md transition-shadow relative"
+                    ) as card:
+                        # Try GIF first (filesystem stat); only hit DB for thumbs if no GIF
+                        thumb_url = face_mod.get_gif_url(entity_rel, [])
+                        if not thumb_url:
+                            thumbs = _person_thumbs(person, n=1)
+                            thumb_url = thumbs[0] if thumbs else ""
+                        if thumb_url:
+                            ui.image(thumb_url).classes(
+                                "w-full aspect-square object-cover rounded"
+                            ).props("loading=lazy")
                         else:
-                            merge_status_label.set_text(f"Merge {sel[0]} → {sel[1]}")
-                            _show_merge_people_dialog(
-                                sel[0], sel[1], container, cancel_merge_mode, state
-                            )
+                            ui.element("div").classes("w-full aspect-square bg-gray-100 rounded")
 
-                    return on_click
+                        # Clickable overlay — covers the whole card; prevented in merge mode
+                        ui.html(
+                            f'<a href="/gallery/{quote(person)}" '
+                            f'class="absolute inset-0 z-0" '
+                            f"onclick=\"if(this.closest('[data-merge]')){{event.preventDefault();}}\""
+                            f"></a>"
+                        )
 
-                card.on("click", make_select_handler(person))
+                        ui.label(person).classes("font-semibold mt-2 truncate")
+                        ui.label(f"{count} file{'s' if count != 1 else ''}").classes(
+                            "text-xs text-gray-400"
+                        )
+
+                        # Clickable tag chips — click.stop prevents merge-mode card selection
+                        with ui.row().classes("gap-1 flex-wrap items-center mt-1 relative z-10"):
+                            for t in person_tags.get(person, []):
+                                chip = (
+                                    ui.chip(t).props("dense outline clickable").classes("text-xs")
+                                )
+
+                                def _chip_click(_t=t):
+                                    current = list(tag_filter.value or [])
+                                    if _t not in current:
+                                        current.append(_t)
+                                        tag_filter.set_value(current)
+                                        if state is not None:
+                                            state["cat_page"] = 0
+                                        _deactivate_untagged_if_needed()
+                                        asyncio.ensure_future(on_filter_change())
+                                        _sync_cat_url()
+
+                                chip.on("click.stop", _chip_click)
+
+                        def make_select_handler(p):
+                            def on_click():
+                                if not merge_state["mode"]:
+                                    return  # <a> overlay handles navigation
+                                if p in merge_state["selected"]:
+                                    merge_state["selected"].remove(p)
+                                elif len(merge_state["selected"]) < 2:
+                                    merge_state["selected"].append(p)
+
+                                sel = merge_state["selected"]
+                                if len(sel) == 0:
+                                    merge_status_label.set_text("Select two people to merge")
+                                elif len(sel) == 1:
+                                    merge_status_label.set_text(
+                                        f"Selected: {sel[0]} — select one more"
+                                    )
+                                else:
+                                    merge_status_label.set_text(f"Merge {sel[0]} → {sel[1]}")
+                                    _show_merge_people_dialog(
+                                        sel[0], sel[1], container, cancel_merge_mode, state
+                                    )
+
+                            return on_click
+
+                        card.on("click", make_select_handler(person))
+
+        _build_pager(bottom_pager, page, total_pages, _go)
+
+        if merge_state["mode"]:
+            ui.run_javascript("document.getElementById('cat-grid').dataset.merge='1'")
 
     async def on_filter_change():
         await asyncio.sleep(0.15)
-        query = filter_input.value.strip().casefold()
-        selected_tags = tag_filter.value or []
         if state is not None:
             state["cat_filter"] = filter_input.value
-            state["cat_tag_filter"] = selected_tags
-        for _p, _card in person_cards.items():
-            name_ok = not query or query in _p.casefold()
-            tags_ok = not selected_tags or all(t in person_tags.get(_p, []) for t in selected_tags)
-            _card.set_visibility(name_ok and tags_ok)
+            state["cat_tag_filter"] = tag_filter.value or []
         if merge_state["mode"]:
             merge_state["selected"] = []
             merge_status_label.set_text("Select two people to merge")
+        _update_view(page=0)
 
-    filter_input.on("update:model-value", lambda: asyncio.ensure_future(on_filter_change()))
-    tag_filter.on("update:model-value", lambda: asyncio.ensure_future(on_filter_change()))
+    def _sync_cat_url():
+        # Must be called from a NiceGUI event handler (not after an await).
+        cur = state.get("cat_page", 0) if state is not None else 0
+        params = ["tab=categorized"]
+        if not untagged_only["value"] and filter_input.value:
+            params.append(f"filter={quote(filter_input.value)}")
+        if not untagged_only["value"] and tag_filter.value:
+            params.append(f"tags={quote(','.join(tag_filter.value))}")
+        if untagged_only["value"]:
+            params.append("untagged=1")
+        if cur > 0:
+            params.append(f"page={cur + 1}")
+        ui.run_javascript(f"history.replaceState(null, '', '/organize?{'&'.join(params)}')")
+
+    def _deactivate_untagged_if_needed():
+        """Deactivate untagged mode if a tag or text filter is being applied (mutual exclusion)."""
+        if untagged_only["value"] and tag_filter.value:
+            untagged_only["value"] = False
+            if state is not None:
+                state["cat_untagged"] = False
+            _untagged_btn_ref[0].props(remove="color=primary")
+
+    def _on_filter_event():
+        _deactivate_untagged_if_needed()
+        asyncio.ensure_future(on_filter_change())
+        _sync_cat_url()
+
+    filter_input.on("update:model-value", _on_filter_event)
+    tag_filter.on("update:model-value", _on_filter_event)
 
     if state is not None and (saved_filter := state.get("cat_filter")):
         filter_input.set_value(saved_filter)
-        asyncio.ensure_future(on_filter_change())
     if state is not None and (saved_tags := state.get("cat_tag_filter")):
         tag_filter.set_value(saved_tags)
-        asyncio.ensure_future(on_filter_change())
+
+    _update_view()
 
 
 def _show_add_more(person: str, container, state: dict | None = None):
@@ -1528,9 +1724,9 @@ def _collection_card_info(collection_name: str, thumb_n: int = 4) -> tuple[int, 
 def _render_collections(container, state: dict | None = None) -> None:
     from . import face as face_mod
 
-    collections = face_mod.list_collections()
+    all_collections = face_mod.list_collections()
 
-    if not collections:
+    if not all_collections:
         with ui.column().classes("items-center gap-2 py-8"):
             ui.icon("collections").classes("text-4xl text-gray-300")
             ui.label("No collections yet.").classes("text-gray-500")
@@ -1543,9 +1739,9 @@ def _render_collections(container, state: dict | None = None) -> None:
     coll_tags: dict[str, list[str]] = face_mod.get_all_tags("collection")
 
     with ui.row().classes("items-center justify-between w-full mb-2 gap-2"):
-        ui.label(f"{len(collections)} collection{'s' if len(collections) != 1 else ''}").classes(
-            "text-sm text-gray-500 shrink-0"
-        )
+        coll_count_lbl = ui.label(
+            f"{len(all_collections)} collection{'s' if len(all_collections) != 1 else ''}"
+        ).classes("text-sm text-gray-500 shrink-0")
         coll_filter_input = ui.input(placeholder="Filter...").classes("flex-1")
         coll_tag_filter = ui.select(
             face_mod.list_all_tags("collection"),
@@ -1554,68 +1750,135 @@ def _render_collections(container, state: dict | None = None) -> None:
             clearable=True,
         ).classes("w-40")
 
-    coll_cards: dict[str, Any] = {}
+    PAGE_SIZE = 24
+    top_coll_pager = ui.row().classes("items-center justify-center flex-wrap gap-1 my-1")
+    coll_grid_container = ui.column().classes("w-full")
+    bottom_coll_pager = ui.row().classes("items-center justify-center flex-wrap gap-1 my-1")
 
-    with ui.grid(columns=3).classes("w-full gap-4"):
-        for coll_name in collections:
-            try:
-                count, thumbs = _collection_card_info(coll_name)
-            except OSError:
-                continue  # collection deleted externally — skip card
+    def _compute_visible() -> list[str]:
+        query = coll_filter_input.value.strip().casefold()
+        selected_tags = coll_tag_filter.value or []
+        return [
+            c
+            for c in all_collections
+            if (not query or query in c.casefold())
+            and (not selected_tags or all(t in coll_tags.get(c, []) for t in selected_tags))
+        ]
 
-            entity_rel = f"collections/{coll_name}"
+    def _update_view(page: int | None = None):
+        visible = _compute_visible()
+        if state is not None:
+            state["visible_collections"] = visible
 
-            with ui.card().classes(
-                "w-full cursor-pointer hover:shadow-md transition-shadow relative"
-            ) as card:
-                coll_cards[coll_name] = card
+        total_pages = max(1, math.ceil(len(visible) / PAGE_SIZE))
+        if page is None:
+            page = state.get("coll_page", 0) if state is not None else 0
+        page = max(0, min(page, total_pages - 1))
+        if state is not None:
+            state["coll_page"] = page
 
-                # Animated GIF thumbnail with fallback to first individual thumb
-                thumb_url = face_mod.get_gif_url(entity_rel, thumbs)
-                if thumb_url:
-                    ui.image(thumb_url).classes("w-full aspect-square object-cover rounded").props(
-                        "loading=lazy"
-                    )
-                else:
-                    ui.element("div").classes("w-full aspect-square bg-gray-100 rounded")
+        n = len(visible)
+        total = len(all_collections)
+        coll_count_lbl.set_text(
+            f"{n} / {total} collection{'s' if total != 1 else ''}"
+            if n != total
+            else f"{total} collection{'s' if total != 1 else ''}"
+        )
 
-                # Clickable overlay — whole card navigates to collection gallery
-                ui.html(
-                    f'<a href="/collections/{quote(coll_name)}" class="absolute inset-0 z-0"></a>'
-                )
+        def _go(p: int):
+            _update_view(page=p)
+            _sync_coll_url()
 
-                ui.label(coll_name).classes("font-semibold mt-2 truncate")
-                ui.label(f"{count} file{'s' if count != 1 else ''}").classes(
-                    "text-xs text-gray-400"
-                )
+        _build_pager(top_coll_pager, page, total_pages, _go)
 
-                # Read-only tag chips (no click.stop — collections have no merge mode)
-                with ui.row().classes("gap-1 flex-wrap items-center mt-1 relative z-10"):
-                    for t in coll_tags.get(coll_name, []):
-                        ui.chip(t).props("dense outline").classes("text-xs")
+        sliced = visible[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+        coll_grid_container.clear()
+        with coll_grid_container:
+            with ui.element("div").classes(
+                "grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 w-full gap-4"
+            ):
+                for coll_name in sliced:
+                    try:
+                        count, thumbs = _collection_card_info(coll_name)
+                    except OSError:
+                        continue  # collection deleted externally — skip card
+
+                    entity_rel = f"collections/{coll_name}"
+
+                    with ui.card().classes(
+                        "w-full cursor-pointer hover:shadow-md transition-shadow relative"
+                    ):
+                        # Animated GIF thumbnail with fallback to first individual thumb
+                        thumb_url = face_mod.get_gif_url(entity_rel, thumbs)
+                        if thumb_url:
+                            ui.image(thumb_url).classes(
+                                "w-full aspect-square object-cover rounded"
+                            ).props("loading=lazy")
+                        else:
+                            ui.element("div").classes("w-full aspect-square bg-gray-100 rounded")
+
+                        ui.html(
+                            f'<a href="/collections/{quote(coll_name)}"'
+                            ' class="absolute inset-0 z-0"></a>'
+                        )
+
+                        ui.label(coll_name).classes("font-semibold mt-2 truncate")
+                        ui.label(f"{count} file{'s' if count != 1 else ''}").classes(
+                            "text-xs text-gray-400"
+                        )
+
+                        # Clickable tag chips — add to coll_tag_filter on click
+                        with ui.row().classes("gap-1 flex-wrap items-center mt-1 relative z-10"):
+                            for t in coll_tags.get(coll_name, []):
+                                chip = (
+                                    ui.chip(t).props("dense outline clickable").classes("text-xs")
+                                )
+
+                                def _chip_click(_t=t):
+                                    current = list(coll_tag_filter.value or [])
+                                    if _t not in current:
+                                        current.append(_t)
+                                        coll_tag_filter.set_value(current)
+                                        if state is not None:
+                                            state["coll_page"] = 0
+                                        asyncio.ensure_future(on_coll_filter_change())
+                                        _sync_coll_url()
+
+                                chip.on("click.stop", _chip_click)
+
+        _build_pager(bottom_coll_pager, page, total_pages, _go)
 
     async def on_coll_filter_change():
         await asyncio.sleep(0.15)
-        query = coll_filter_input.value.strip().casefold()
-        selected_tags = coll_tag_filter.value or []
         if state is not None:
             state["coll_filter"] = coll_filter_input.value
-            state["coll_tag_filter"] = selected_tags
-        for _c, _card in coll_cards.items():
-            name_ok = not query or query in _c.casefold()
-            tags_ok = not selected_tags or all(t in coll_tags.get(_c, []) for t in selected_tags)
-            _card.set_visibility(name_ok and tags_ok)
+            state["coll_tag_filter"] = coll_tag_filter.value or []
+        _update_view(page=0)
 
-    coll_filter_input.on(
-        "update:model-value", lambda: asyncio.ensure_future(on_coll_filter_change())
-    )
-    coll_tag_filter.on("update:model-value", lambda: asyncio.ensure_future(on_coll_filter_change()))
+    def _sync_coll_url():
+        cur = state.get("coll_page", 0) if state is not None else 0
+        params = ["tab=collections"]
+        if coll_filter_input.value:
+            params.append(f"filter={quote(coll_filter_input.value)}")
+        if coll_tag_filter.value:
+            params.append(f"tags={quote(','.join(coll_tag_filter.value))}")
+        if cur > 0:
+            params.append(f"page={cur + 1}")
+        ui.run_javascript(f"history.replaceState(null, '', '/organize?{'&'.join(params)}')")
+
+    def _on_coll_filter_event():
+        asyncio.ensure_future(on_coll_filter_change())
+        _sync_coll_url()
+
+    coll_filter_input.on("update:model-value", _on_coll_filter_event)
+    coll_tag_filter.on("update:model-value", _on_coll_filter_event)
 
     if state is not None and (sv := state.get("coll_filter")):
         coll_filter_input.set_value(sv)
     if state is not None and (sv := state.get("coll_tag_filter")):
         coll_tag_filter.set_value(sv)
-    asyncio.ensure_future(on_coll_filter_change())
+
+    _update_view()
 
 
 def _show_add_more_to_collection(
@@ -1865,8 +2128,11 @@ def _render_gallery_grid(person: str, images: list[dict], container, count_lbl=N
 
         with ui.element("div").style(_grid_style).props("id=lg-gallery"):
             for img in images:
-                thumb_html = f'<img src="{img["thumb"]}" style="{_thumb_style}" />'
                 if img.get("is_video"):
+                    thumb_html = (
+                        f'<img src="{img["thumb"]}" style="{_thumb_style}"'
+                        f" onerror=\"this.onerror=null;this.src='{_VIDEO_THUMB_FALLBACK}'\" />"
+                    )
                     video_data = json.dumps(
                         {
                             "source": [{"src": img["src"], "type": img["video_type"]}],
@@ -1876,6 +2142,7 @@ def _render_gallery_grid(person: str, images: list[dict], container, count_lbl=N
                     safe_vd = _html.escape(video_data)
                     item_html = f'<a class="lg-item" data-video="{safe_vd}">{thumb_html}</a>'
                 else:
+                    thumb_html = f'<img src="{img["thumb"]}" style="{_thumb_style}" />'
                     item_html = f'<a href="{img["src"]}" class="lg-item">{thumb_html}</a>'
 
                 with ui.element("div").classes("relative group"):
@@ -2029,6 +2296,7 @@ def gallery_page(person: str):
         with ui.row().classes("items-center gap-2 flex-wrap mb-2"):
             ui.label("Tags:").classes("text-sm text-gray-500 shrink-0")
             tag_box = ui.row().classes("gap-1 flex-wrap items-center")
+            tag_inp = ui.input(placeholder="+ tag").classes("w-24 text-sm")
 
         def _render_person_tags():
             tag_box.clear()
@@ -2045,16 +2313,15 @@ def gallery_page(person: str):
 
                     chip.on("remove", _make_rm())
 
-                tag_inp = ui.input(placeholder="+ tag").classes("w-24 text-sm")
+        def _add(_):
+            val = tag_inp.value.strip().lower()
+            if val:
+                face_mod.add_tag("person", person, val)
+                tag_inp.set_value("")
+                _render_person_tags()
+                tag_inp.run_method("focus")
 
-                def _add(_, inp=tag_inp):
-                    val = inp.value.strip().lower()
-                    if val:
-                        face_mod.add_tag("person", person, val)
-                        inp.set_value("")
-                        _render_person_tags()
-
-                tag_inp.on("keydown.enter", _add)
+        tag_inp.on("keydown.enter", _add)
 
         _render_person_tags()
 
@@ -2089,8 +2356,11 @@ def _render_collection_gallery_grid(
 
         with ui.element("div").style(_grid_style).props("id=lg-gallery"):
             for img in images:
-                thumb_html = f'<img src="{img["thumb"]}" style="{_thumb_style}" />'
                 if img.get("is_video"):
+                    thumb_html = (
+                        f'<img src="{img["thumb"]}" style="{_thumb_style}"'
+                        f" onerror=\"this.onerror=null;this.src='{_VIDEO_THUMB_FALLBACK}'\" />"
+                    )
                     video_data = json.dumps(
                         {
                             "source": [{"src": img["src"], "type": img["video_type"]}],
@@ -2100,6 +2370,7 @@ def _render_collection_gallery_grid(
                     safe_vd = _html.escape(video_data)
                     item_html = f'<a class="lg-item" data-video="{safe_vd}">{thumb_html}</a>'
                 else:
+                    thumb_html = f'<img src="{img["thumb"]}" style="{_thumb_style}" />'
                     item_html = f'<a href="{img["src"]}" class="lg-item">{thumb_html}</a>'
 
                 with ui.element("div").classes("relative group"):
@@ -2264,6 +2535,7 @@ def collections_gallery_page(name: str):
         with ui.row().classes("items-center gap-2 flex-wrap mb-2"):
             ui.label("Tags:").classes("text-sm text-gray-500 shrink-0")
             coll_tag_box = ui.row().classes("gap-1 flex-wrap items-center")
+            tag_inp = ui.input(placeholder="+ tag").classes("w-24 text-sm")
 
         def _render_coll_tags():
             coll_tag_box.clear()
@@ -2280,16 +2552,15 @@ def collections_gallery_page(name: str):
 
                     chip.on("remove", _make_rm())
 
-                tag_inp = ui.input(placeholder="+ tag").classes("w-24 text-sm")
+        def _add(_):
+            val = tag_inp.value.strip().lower()
+            if val:
+                face_mod.add_tag("collection", name, val)
+                tag_inp.set_value("")
+                _render_coll_tags()
+                tag_inp.run_method("focus")
 
-                def _add(_, inp=tag_inp):
-                    val = inp.value.strip().lower()
-                    if val:
-                        face_mod.add_tag("collection", name, val)
-                        inp.set_value("")
-                        _render_coll_tags()
-
-                tag_inp.on("keydown.enter", _add)
+        tag_inp.on("keydown.enter", _add)
 
         _render_coll_tags()
 

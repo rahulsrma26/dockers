@@ -281,7 +281,7 @@ def _invalidate_gif(entity_rel: str) -> None:
 
 
 def _generate_animated_gif(entity_rel: str, thumb_paths: list[str]) -> None:
-    """Stitch up to 4 thumbs into an animated GIF (800 ms/frame, infinite loop). Executor-only."""
+    """Stitch up to 4 thumbs into an animated GIF (1500 ms/frame, infinite loop). Executor-only."""
     from PIL import Image, ImageOps
 
     size = 320
@@ -303,7 +303,7 @@ def _generate_animated_gif(entity_rel: str, thumb_paths: list[str]) -> None:
         save_all=True,
         append_images=frames[1:],
         loop=0,
-        duration=800,
+        duration=1500,
     )
 
 
@@ -366,8 +366,38 @@ def get_gif_url(entity_rel: str, fallback_rels: list[str]) -> str:
     return ""
 
 
+_GIF_SPEED_VERSION = "2"  # bump this when the animation duration constant changes
+
+
+def _check_gif_version() -> None:
+    """Delete all animated GIFs if the speed version sentinel doesn't match. Executor-only."""
+    td = _thumbs_dir()
+    sentinel = os.path.join(td, ".gif_version")
+    if os.path.isfile(sentinel):
+        try:
+            with open(sentinel) as f:
+                if f.read().strip() == _GIF_SPEED_VERSION:
+                    return
+        except OSError:
+            pass  # unreadable sentinel → fall through to purge + recreate
+    if os.path.isdir(td):
+        for fn in os.listdir(td):
+            if fn.endswith(".gif"):
+                try:
+                    os.remove(os.path.join(td, fn))
+                except Exception:
+                    pass
+    os.makedirs(td, exist_ok=True)
+    try:
+        with open(sentinel, "w") as f:
+            f.write(_GIF_SPEED_VERSION)
+    except OSError:
+        pass  # non-fatal; will retry on next startup
+
+
 def warmup_missing_gifs() -> None:
     """Generate animated GIFs for all persons/collections that don't have one yet. Executor-only."""
+    _check_gif_version()
     cat_dir = _categorized_dir()
     if os.path.isdir(cat_dir):
         for name in os.listdir(cat_dir):
@@ -619,13 +649,47 @@ def _scan_image_file(file_path: str, rel: str, mtime: float, face_model: str) ->
 
 
 def _generate_video_thumb(file_path: str, rel_path: str) -> None:
-    import cv2
-    from PIL import Image
+    import shutil
+    import subprocess
 
-    cv2.setLogLevel(0)  # suppress FFmpeg decoder warnings from flooding logs
+    out_path = _thumb_path(rel_path)
+    os.makedirs(_thumbs_dir(), exist_ok=True)
+
+    if shutil.which("ffmpeg"):
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    "00:00:01",
+                    "-i",
+                    file_path,
+                    "-vframes",
+                    "1",
+                    "-vf",
+                    "scale=256:256:force_original_aspect_ratio=decrease",
+                    "-loglevel",
+                    "error",
+                    out_path,
+                ],
+                timeout=30,
+                capture_output=True,
+            )
+            if (
+                result.returncode == 0
+                and os.path.isfile(out_path)
+                and os.path.getsize(out_path) > 0
+            ):
+                return
+        except Exception:
+            pass
+
+    import cv2
+
+    cv2.setLogLevel(0)
     cap = cv2.VideoCapture(file_path)
     try:
-        # Try frame 30 (~1s at 30fps), fall back to first frame
         cap.set(cv2.CAP_PROP_POS_FRAMES, 30)
         ret, frame = cap.read()
         if not ret:
@@ -633,11 +697,8 @@ def _generate_video_thumb(file_path: str, rel_path: str) -> None:
             ret, frame = cap.read()
         if not ret:
             return
-        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        img.thumbnail((256, 256))
-        out_path = _thumb_path(rel_path)
-        os.makedirs(_thumbs_dir(), exist_ok=True)
-        img.save(out_path, "JPEG", quality=80)
+        frame_small = cv2.resize(frame, (256, 256))
+        cv2.imwrite(out_path, frame_small, [cv2.IMWRITE_JPEG_QUALITY, 80])
     finally:
         cap.release()
 

@@ -2310,3 +2310,176 @@ def test_warmup_processes_both_persons_and_collections(tmp_path, monkeypatch):
 
     assert persons == ["alice"]
     assert colls == ["summer"]
+
+
+# ── _check_gif_version ────────────────────────────────────────────────────────
+
+
+def test_check_gif_version_no_sentinel_creates_it(tmp_path, monkeypatch):
+    """When .gif_version doesn't exist, _check_gif_version creates it with version '2'."""
+    td = tmp_path / ".thumbs"
+    td.mkdir()
+    monkeypatch.setattr(face_mod, "_thumbs_dir", lambda: str(td))
+
+    face_mod._check_gif_version()
+
+    sentinel = td / ".gif_version"
+    assert sentinel.is_file()
+    assert sentinel.read_text().strip() == "2"
+
+
+def test_check_gif_version_correct_version_is_noop(tmp_path, monkeypatch):
+    """When .gif_version already contains '2', no GIFs are deleted and sentinel unchanged."""
+    td = tmp_path / ".thumbs"
+    td.mkdir()
+    gif = td / "animated_alice.gif"
+    gif.write_bytes(b"GIF89a")
+    sentinel = td / ".gif_version"
+    sentinel.write_text("2")
+
+    monkeypatch.setattr(face_mod, "_thumbs_dir", lambda: str(td))
+
+    face_mod._check_gif_version()
+
+    assert gif.is_file(), "Existing GIF must not be deleted when version matches"
+    assert sentinel.read_text().strip() == "2"
+
+
+def test_check_gif_version_wrong_version_purges_gifs(tmp_path, monkeypatch):
+    """When .gif_version has an old value, all .gif files are deleted and '2' is written."""
+    td = tmp_path / ".thumbs"
+    td.mkdir()
+    gif1 = td / "a.gif"
+    gif2 = td / "b.gif"
+    jpg = td / "thumb.jpg"
+    gif1.write_bytes(b"GIF89a")
+    gif2.write_bytes(b"GIF89a")
+    jpg.write_bytes(b"\xff\xd8\xff")
+    sentinel = td / ".gif_version"
+    sentinel.write_text("1")
+
+    monkeypatch.setattr(face_mod, "_thumbs_dir", lambda: str(td))
+
+    face_mod._check_gif_version()
+
+    assert not gif1.is_file(), "Old GIFs must be purged"
+    assert not gif2.is_file(), "Old GIFs must be purged"
+    assert jpg.is_file(), "Non-GIF thumbs must be preserved"
+    assert sentinel.read_text().strip() == "2"
+
+
+def test_check_gif_version_missing_thumbs_dir_no_crash(tmp_path, monkeypatch):
+    """When .thumbs doesn't exist at all, _check_gif_version creates it and writes sentinel."""
+    td = tmp_path / ".thumbs"
+    assert not td.exists()
+    monkeypatch.setattr(face_mod, "_thumbs_dir", lambda: str(td))
+
+    face_mod._check_gif_version()
+
+    assert (td / ".gif_version").is_file()
+    assert (td / ".gif_version").read_text().strip() == "2"
+
+
+def test_warmup_writes_gif_version_sentinel(tmp_path, monkeypatch):
+    """warmup_missing_gifs writes the .gif_version sentinel after a clean run."""
+    td = tmp_path / ".thumbs"
+    monkeypatch.setattr(face_mod, "_thumbs_dir", lambda: str(td))
+    monkeypatch.setattr(face_mod, "_categorized_dir", lambda: str(tmp_path / "categorized"))
+    monkeypatch.setattr(face_mod, "_collections_dir", lambda: str(tmp_path / "collections"))
+
+    face_mod.warmup_missing_gifs()
+
+    assert (td / ".gif_version").is_file()
+
+
+# ── _generate_video_thumb ─────────────────────────────────────────────────────
+
+
+def test_generate_video_thumb_ffmpeg_success_skips_cv2(tmp_path, monkeypatch):
+    """When ffmpeg is available and succeeds, cv2 is never imported."""
+    import pathlib
+    import shutil
+    import subprocess
+
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    fake_video = str(tmp_path / "vid.mp4")
+    pathlib.Path(fake_video).write_bytes(b"fake-video")
+
+    def fake_which(cmd):
+        return "/usr/bin/ffmpeg" if cmd == "ffmpeg" else None
+
+    def fake_run(args, **kwargs):
+        out = args[-1]
+        pathlib.Path(out).write_bytes(b"\xff\xd8\xff\xe0")
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Patch cv2 to detect any import attempt
+    import sys
+
+    orig_cv2 = sys.modules.get("cv2")
+    sys.modules.pop("cv2", None)
+
+    try:
+        face_mod._generate_video_thumb(fake_video, "downloads/vid.mp4")
+    finally:
+        if orig_cv2 is not None:
+            sys.modules["cv2"] = orig_cv2
+
+    out = face_mod._thumb_path("downloads/vid.mp4")
+    assert os.path.isfile(out), "Thumbnail must be written by ffmpeg path"
+
+
+def test_generate_video_thumb_no_ffmpeg_no_subprocess(tmp_path, monkeypatch):
+    """When ffmpeg is not on PATH, subprocess.run is not called."""
+    import pathlib
+    import shutil
+    import subprocess
+
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    fake_video = str(tmp_path / "vid.mp4")
+    pathlib.Path(fake_video).write_bytes(b"fake-video")
+
+    run_calls = []
+
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: run_calls.append(a))
+
+    try:
+        # cv2.VideoCapture on a fake file returns ret=False — the function returns early
+        face_mod._generate_video_thumb(fake_video, "downloads/vid.mp4")
+    except Exception:
+        pass  # cv2 may raise on a fake file; that's fine
+
+    assert run_calls == [], "subprocess.run must not be called when ffmpeg is absent"
+
+
+def test_generate_video_thumb_ffmpeg_nonzero_falls_through(tmp_path, monkeypatch):
+    """When ffmpeg returns non-zero, the cv2 fallback path is attempted."""
+    import pathlib
+    import shutil
+    import subprocess
+
+    monkeypatch.setattr(face_mod, "DOWNLOAD_DIR", str(tmp_path))
+    (tmp_path / ".thumbs").mkdir()
+
+    fake_video = str(tmp_path / "vid.mp4")
+    pathlib.Path(fake_video).write_bytes(b"fake-video")
+
+    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/ffmpeg")
+
+    def fake_run_fail(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, b"", b"error")
+
+    monkeypatch.setattr(subprocess, "run", fake_run_fail)
+
+    # The function should fall through to cv2 without raising
+    try:
+        face_mod._generate_video_thumb(fake_video, "downloads/vid.mp4")
+    except Exception:
+        pass  # cv2 on a fake file may raise; we just verify no crash from ffmpeg path

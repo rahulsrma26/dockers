@@ -5,6 +5,7 @@ import shutil
 from datetime import timedelta
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
+from urllib.parse import urlparse
 
 from nicegui import app, ui
 from sqlalchemy import delete, select
@@ -35,6 +36,17 @@ SESSION_TIMEOUT_MINUTES = int(os.environ.get("SESSION_TIMEOUT_MINUTES", "15"))
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 BUNDLED_PLUGINS_DIR = os.path.join(THIS_DIR, "plugins")
+
+
+def _has_plugin(url: str) -> bool:
+    """Return True if a plugin file exists for the URL's domain."""
+    domain = urlparse(url).hostname or ""
+    name = domain.removeprefix("www.")
+    user_dir = os.environ.get("PLUGINS_DIR", "plugins")
+    return os.path.isfile(os.path.join(user_dir, f"{name}.py")) or os.path.isfile(
+        os.path.join(BUNDLED_PLUGINS_DIR, f"{name}.py")
+    )
+
 
 _DATA_DIR = os.path.dirname(os.path.abspath(os.environ.get("DB_PATH", "scrap_downloader.db")))
 COOKIES_DIR = os.path.join(_DATA_DIR, "cookies")
@@ -224,6 +236,7 @@ def _fetch_task_snapshot(task_id: int) -> dict | None:
             "url": task.url,
             "extra_args": task.extra_args,
             "progress": task.progress,
+            "files_downloaded": task.files_downloaded,
             "error": task.error,
             "created_at": task.created_at,
             "completed_at": task.completed_at,
@@ -239,6 +252,7 @@ def _make_detail_rows(snap: dict) -> list[dict]:
         {"field": "URL", "value": snap["url"], "isDate": False},
         {"field": "Extra args", "value": snap["extra_args"] or "—", "isDate": False},
         {"field": "Progress", "value": f"{snap['progress']:.0f}%", "isDate": False},
+        {"field": "Files downloaded", "value": str(snap["files_downloaded"]), "isDate": False},
         {"field": "Error", "value": snap["error"] or "—", "isDate": False},
         {"field": "Created at", "value": snap["created_at"].isoformat() + "Z", "isDate": True},
         {
@@ -319,7 +333,7 @@ def main_page():
         def cancel():
             with get_session() as session:
                 t = session.get(Task, task_id)
-                if t is None:
+                if t is None or t.status not in (TaskStatus.pending, TaskStatus.in_progress):
                     d.close()
                     return
                 t.status = TaskStatus.failed
@@ -392,6 +406,14 @@ def main_page():
         d.on("hide", on_hide)
         d.open()
 
+    dark = ui.dark_mode()
+    dark.set_value(app.storage.user.get("dark_mode", False))
+
+    def _toggle_dark(dark=dark):
+        new_val = not dark.value
+        dark.set_value(new_val)
+        app.storage.user["dark_mode"] = new_val
+
     with ui.column().classes("w-full max-w-4xl mx-auto p-4 gap-4"):
         with ui.row().classes("items-center justify-between w-full"):
             with ui.row().classes("items-baseline gap-2"):
@@ -399,8 +421,12 @@ def main_page():
                 ui.label(f"v{APP_VERSION}").classes("text-sm text-gray-400")
                 ui.link("Downloads", "/").classes("text-sm text-blue-500 ml-4")
                 ui.link("Organize", "/organize").classes("text-sm text-blue-500")
-            if PASSWORD:
-                ui.button("Logout", icon="logout", on_click=logout).props("flat")
+            with ui.row().classes("gap-1"):
+                ui.button(icon="dark_mode", on_click=_toggle_dark).props("flat round").tooltip(
+                    "Toggle dark mode"
+                )
+                if PASSWORD:
+                    ui.button("Logout", icon="logout", on_click=logout).props("flat")
 
         with ui.card().classes("w-full"):
             with ui.tabs().classes("w-full") as tabs:
@@ -425,6 +451,13 @@ def main_page():
                             ui.notify("URL and tag are required", color="negative")
                             return
                         touch_activity()
+                        if not _has_plugin(url):
+                            domain = urlparse(url).hostname or url
+                            ui.notify(
+                                f"No plugin for {domain} — falling back to yt-dlp",
+                                color="warning",
+                                timeout=5000,
+                            )
                         media_type = auto_media.value
 
                         def do_queue():
@@ -581,6 +614,7 @@ def main_page():
             tbl = ui.table(
                 columns=_QUEUE_COLUMNS,
                 rows=_fetch_queue_rows(),
+                pagination={"rowsPerPage": 20},
             ).classes("w-full table-fixed")
             tbl.on("rowClick", lambda e: show_task_detail(e.args[1]))
             queue_tbl["ref"] = tbl

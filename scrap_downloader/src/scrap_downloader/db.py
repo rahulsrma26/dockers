@@ -52,6 +52,7 @@ class Task(Base):
     extra_args: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, default=TaskStatus.pending)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
+    files_downloaded: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -239,6 +240,12 @@ def init_db() -> None:
     with engine.connect() as conn:
         try:
             conn.execute(text("ALTER TABLE merge_log ADD COLUMN file_map TEXT"))
+            conn.commit()
+        except Exception:
+            pass
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN files_downloaded INTEGER DEFAULT 0"))
             conn.commit()
         except Exception:
             pass
